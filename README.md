@@ -15,7 +15,8 @@ V1 is a single-row admin form. There is no CSV import, no public REST, no nopriv
 ## Dependencies
 
 - WordPress ≥ 6.5 (developed against 7.1)
-- WooCommerce ≥ 8 (developed against **11.1.0**, HPOS on)
+- WooCommerce ≥ 8 (developed against **11.1.0**)
+- **WooCommerce HPOS must be on.** V1 will not run against legacy CPT order storage; crash-safe import identity depends on `created_via` in the HPOS order INSERT.
 - Tickets & Passes for WooCommerce **≥ 1.3.0**, with the Ticket product type enabled
 
 ## Ticket product for this importer
@@ -84,13 +85,15 @@ Each import is a real WooCommerce order at the **current product price**, dated 
 - Confirm the same import ID again: no extra order, stock, tickets or mail
 - Deactivate this plugin: order and tickets remain; scanner still accepts them
 
-## Tests
+## Development / source checkout
+
+PHPUnit lives in the Git repository, not in the WordPress plugin zip.
 
 ```bash
 bash tests/run.sh
 ```
 
-Requires the local WordPress path (default `/var/www/woocommerce`) with WooCommerce and TPFW active. Set `TPFWLI_WP_PATH` if needed.
+Requires the local WordPress path (default `/var/www/woocommerce`) with WooCommerce, HPOS and TPFW active. Set `TPFWLI_WP_PATH` if needed.
 
 “Email sent” in the UI means the WooCommerce mailer returned success. It does not prove the message reached the inbox.
 
@@ -103,11 +106,5 @@ GPLv2 or later. See [`LICENSE`](LICENSE).
 Use the WordPress plugin zip from the GitHub Release — not GitHub’s automatically generated **Source code** archive.
 
 **Tickets & Passes – Legacy Ticket Importer 1.0.0**
-
-| | |
-|---|---|
-| Version | 1.0.0 |
-| File | `tickets-passes-legacy-importer-1.0.0.zip` |
-| SHA-256 | `a683e6698c664042464d463ef8cbcfcd024bd4bbee06abb6d635bd4cae6421ce` |
 
 [⬇ Download the WordPress plugin](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)

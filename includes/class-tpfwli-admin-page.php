@@ -131,6 +131,13 @@ final class TPFWLI_Admin_Page
 
 	private function require_post(string $action): void
 	{
+		if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+			wp_die(
+				esc_html__('This importer action must be submitted with POST.', 'tickets-passes-legacy-importer'),
+				esc_html__('Tickets & Passes – Legacy Ticket Importer', 'tickets-passes-legacy-importer'),
+				array('response' => 405)
+			);
+		}
 		if (!current_user_can('manage_woocommerce')) {
 			wp_die(esc_html__('You do not have permission to import legacy tickets.', 'tickets-passes-legacy-importer'), 403);
 		}

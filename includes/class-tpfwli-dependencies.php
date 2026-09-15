@@ -42,7 +42,25 @@ final class TPFWLI_Dependencies
 			}
 		}
 
+		if (class_exists('WooCommerce') && !self::hpos_enabled()) {
+			$problems[] = __('Tickets & Passes – Legacy Ticket Importer requires WooCommerce HPOS to guarantee crash-safe import idempotency.', 'tickets-passes-legacy-importer');
+		}
+
 		return $problems;
+	}
+
+	/**
+	 * True when WooCommerce is actually reading/writing orders via HPOS tables.
+	 */
+	public static function hpos_enabled(): bool
+	{
+		if (!class_exists(\Automattic\WooCommerce\Utilities\OrderUtil::class)) {
+			return false;
+		}
+		if (!method_exists(\Automattic\WooCommerce\Utilities\OrderUtil::class, 'custom_orders_table_usage_is_enabled')) {
+			return false;
+		}
+		return (bool) \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled();
 	}
 
 	public static function ready(bool $require_runtime_hooks = true): bool

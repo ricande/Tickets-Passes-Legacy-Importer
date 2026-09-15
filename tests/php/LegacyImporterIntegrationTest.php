@@ -63,6 +63,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 		self::$mail = array();
 		self::$mail_fail = false;
 		wp_set_current_user(self::$admin_id);
+		$_SERVER['REQUEST_METHOD'] = 'POST';
 		$ticket = wc_get_product(self::$ticket_id);
 		if ($ticket) {
 			$ticket->set_stock_quantity(50);
@@ -112,6 +113,25 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_confirm');
 		$this->expectWpDie();
 		(new TPFWLI_Admin_Page())->handle_confirm();
+	}
+
+	public function test_get_with_valid_nonce_does_not_mutate(): void
+	{
+		$_SERVER['REQUEST_METHOD'] = 'GET';
+		$_POST = $this->valid_input();
+		$_POST['action'] = 'tpfwli_confirm';
+		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_confirm');
+		$before_orders = $this->count_import_orders();
+		$before_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$this->installWpDieThrower();
+		try {
+			(new TPFWLI_Admin_Page())->handle_confirm();
+			$this->fail('GET confirm should have been refused');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('wp_die:', $e->getMessage());
+		}
+		$this->assertSame($before_orders, $this->count_import_orders());
+		$this->assertSame($before_stock, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
 	}
 
 	public function test_invalid_email_is_refused(): void
@@ -455,8 +475,10 @@ final class LegacyImporterIntegrationTest extends TestCase
 		self::$mail_fail = false;
 		$this->assertFalse($first['ok']);
 		$this->assertSame('issued', (string) $first['order']->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$stock_after_issue = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
 		$product = wc_get_product(self::$ticket_id);
 		$product->update_meta_data('_tpfw_ticket_max_uses', 9);
+		$product->update_meta_data('_tpfw_ticket_predefined_start_date_enable', 'no');
 		$product->save();
 		self::$mail = array();
 		try {
@@ -464,6 +486,47 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
 			$this->assertSame($first['nanos'], $retry['nanos']);
 			$this->assertCount(1, self::$mail);
+			$this->assertSame($stock_after_issue, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		} finally {
+			$product = wc_get_product(self::$ticket_id);
+			$product->update_meta_data('_tpfw_ticket_max_uses', 1);
+			$product->update_meta_data('_tpfw_ticket_predefined_start_date_enable', 'yes');
+			$product->save();
+		}
+	}
+
+	public function test_product_config_drift_after_stock_blocks_issue_retry(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'drift-retry-issue@example.com',
+			'first_name' => 'DriftRetryIssue',
+			'quantity'   => '2',
+		));
+		$blocker = static function () {
+			return false;
+		};
+		add_filter('tpfwli_allow_force_issue', $blocker);
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		remove_filter('tpfwli_allow_force_issue', $blocker);
+		$this->assertFalse($first['ok']);
+		$order = $first['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertTrue((new TPFWLI_Stock_Service())->is_reduced($order));
+		$stock_after = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame('not_sent', (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+
+		$product = wc_get_product(self::$ticket_id);
+		$product->update_meta_data('_tpfw_ticket_max_uses', 9);
+		$product->save();
+		self::$mail = array();
+		try {
+			$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_issue');
+			$this->assertFalse($retry['ok']);
+			$this->assertSame($stock_after, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+			$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+			$this->assertCount(0, self::$mail);
+			$this->assertNotSame('issued', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
 		} finally {
 			$product = wc_get_product(self::$ticket_id);
 			$product->update_meta_data('_tpfw_ticket_max_uses', 1);
@@ -494,6 +557,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 	public function test_activation_hook_and_runtime_dependency_checks_exist(): void
 	{
 		$this->assertTrue(function_exists('tpfwli_activate'));
+		$this->assertTrue(TPFWLI_Dependencies::hpos_enabled());
 		$this->assertSame(array(), TPFWLI_Dependencies::problems(false));
 		$this->assertNotFalse(has_action('activate_' . plugin_basename(TPFWLI_PLUGIN_FILE)));
 	}
@@ -700,12 +764,17 @@ final class LegacyImporterIntegrationTest extends TestCase
 
 	private function expectWpDie(): void
 	{
+		$this->installWpDieThrower();
+		$this->expectException(RuntimeException::class);
+	}
+
+	private function installWpDieThrower(): void
+	{
 		add_filter('wp_die_handler', static function () {
 			return static function ($message) {
 				throw new RuntimeException('wp_die:' . wp_strip_all_tags((string) $message));
 			};
 		});
-		$this->expectException(RuntimeException::class);
 	}
 
 	private static function ensure_user(string $login, string $role): int

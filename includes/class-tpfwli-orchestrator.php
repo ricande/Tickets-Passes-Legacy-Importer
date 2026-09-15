@@ -116,6 +116,25 @@ final class TPFWLI_Orchestrator
 				}
 			}
 
+			if ($mode === 'retry_email' && $existing instanceof WC_Order) {
+				$quantity = (int) $existing->get_meta(TPFWLI_Plugin::META_EXPECTED_QUANTITY);
+				if ($quantity < 1) {
+					return $this->fail_result(
+						array(__('This importer order is missing its locked quantity snapshot.', 'tickets-passes-legacy-importer')),
+						$existing,
+						$import_id
+					);
+				}
+				if ((string) $existing->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE) !== 'issued') {
+					return $this->fail_result(
+						array(__('Tickets are not issued yet; email retry is not available.', 'tickets-passes-legacy-importer')),
+						$existing,
+						$import_id
+					);
+				}
+				return $this->maybe_send_email($existing, $quantity);
+			}
+
 			$need_stock_headroom = true;
 			if ($existing instanceof WC_Order) {
 				$need_stock_headroom = !$this->stock->is_reduced($existing);
@@ -124,10 +143,6 @@ final class TPFWLI_Orchestrator
 			$product = $this->adapter->validate_ticket_product($product_id, $quantity, $need_stock_headroom);
 			if (!$product['ok'] || !$product['product'] instanceof WC_Product) {
 				return $this->fail_result($product['errors'], $existing, $import_id);
-			}
-
-			if ($mode === 'retry_email' && $existing instanceof WC_Order) {
-				return $this->maybe_send_email($existing, $quantity, $product['meta']);
 			}
 
 			$created = $this->orders->create_or_resume($import_id, $data, $product['product'], $quantity, $product['meta']);
@@ -162,7 +177,7 @@ final class TPFWLI_Orchestrator
 			$order = $shaped['order'];
 
 			$issue_stage = (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE);
-			if ($issue_stage !== 'issued' && !$this->stock->is_reduced($order)) {
+			if ($issue_stage !== 'issued') {
 				$drift = $this->adapter->current_matches_snapshot($locked_product, $order);
 				if (!$drift['ok']) {
 					foreach ($drift['errors'] as $note) {
@@ -272,6 +287,24 @@ final class TPFWLI_Orchestrator
 		$issue_stage = (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE);
 
 		if ($issue_stage !== 'issued') {
+			$expected_pid = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID);
+			$live_product = wc_get_product($expected_pid);
+			if (!$live_product instanceof WC_Product) {
+				return $this->fail_result(
+					array(__('The locked Ticket product no longer exists. Ticket issue was not run.', 'tickets-passes-legacy-importer')),
+					$order,
+					(string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID)
+				);
+			}
+			$drift = $this->adapter->current_matches_snapshot($live_product, $order);
+			if (!$drift['ok']) {
+				foreach ($drift['errors'] as $note) {
+					$order->add_order_note($note);
+				}
+				$order->save();
+				return $this->fail_result($drift['errors'], $order, (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+			}
+
 			$this->orders->set_stage($order, TPFWLI_Plugin::META_ISSUE_STAGE, 'issuing');
 			if (!$this->adapter->force_issue((int) $order->get_id())) {
 				$this->orders->set_stage(
@@ -320,15 +353,14 @@ final class TPFWLI_Orchestrator
 			return $this->result(true, array(), $order, $verified['nanos']);
 		}
 
-		return $this->maybe_send_email($order, $quantity, $product_meta, $verified['nanos']);
+		return $this->maybe_send_email($order, $quantity, $verified['nanos']);
 	}
 
 	/**
-	 * @param array<string,mixed> $product_meta
-	 * @param string[]            $nanos
+	 * @param string[] $nanos
 	 * @return array<string,mixed>
 	 */
-	private function maybe_send_email(WC_Order $order, int $quantity, array $product_meta, array $nanos = array()): array
+	private function maybe_send_email(WC_Order $order, int $quantity, array $nanos = array()): array
 	{
 		$order = wc_get_order($order->get_id());
 		if ((string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE) !== 'issued') {
