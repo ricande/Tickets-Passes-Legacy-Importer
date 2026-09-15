@@ -106,5 +106,6 @@ Use the WordPress plugin zip from the GitHub Release — not GitHub’s automati
 |---|---|
 | Version | 1.0.0 |
 | File | `tickets-passes-legacy-importer-1.0.0.zip` |
+| SHA-256 | `a683e6698c664042464d463ef8cbcfcd024bd4bbee06abb6d635bd4cae6421ce` |
 
 [⬇ Download the WordPress plugin](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)
