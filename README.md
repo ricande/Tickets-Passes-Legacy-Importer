@@ -4,6 +4,17 @@ Temporary **admin-only** WordPress plugin. It turns one already-paid historical 
 
 It is **not** part of Tickets & Passes for WooCommerce. Do not install it on production until you have run it against a disposable copy of the shop.
 
+[![Release](https://img.shields.io/github/v/release/ricande/Tickets-Passes-Legacy-Importer?label=release)](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/tag/1.0.0)
+[![WordPress](https://img.shields.io/badge/WordPress-6.5%2B-21759b)](https://wordpress.org)
+[![WooCommerce](https://img.shields.io/badge/WooCommerce-HPOS-7f54b3)](https://woocommerce.com)
+[![PHP](https://img.shields.io/badge/PHP-8.0%2B-777bb4)](https://www.php.net)
+[![License](https://img.shields.io/badge/license-GPLv2%2B-blue.svg)](LICENSE)
+
+[**Download 1.0.0**](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)
+· [Report an issue](https://github.com/ricande/Tickets-Passes-Legacy-Importer/issues/new)
+
+Shop-owner install notes also live in [`readme.txt`](readme.txt). How tests vs the WordPress zip are split: [`docs/release.md`](docs/release.md).
+
 ## What it is for
 
 A shop that already sold entrance tickets before TPFW 1.3.0 was installed. For each old purchase you have at least:
@@ -87,13 +98,19 @@ Each import is a real WooCommerce order at the **current product price**, dated 
 
 ## Development / source checkout
 
-PHPUnit lives in the Git repository, not in the WordPress plugin zip.
+PHPUnit lives in the Git repository, not in the WordPress plugin zip. See [`docs/release.md`](docs/release.md).
 
 ```bash
 bash tests/run.sh
 ```
 
 Requires the local WordPress path (default `/var/www/woocommerce`) with WooCommerce, HPOS and TPFW active. Set `TPFWLI_WP_PATH` if needed.
+
+WordPress plugin zip:
+
+```bash
+bash scripts/build-plugin-zip.sh
+```
 
 “Email sent” in the UI means the WooCommerce mailer returned success. It does not prove the message reached the inbox.
 
@@ -107,4 +124,12 @@ Use the WordPress plugin zip from the GitHub Release — not GitHub’s automati
 
 **Tickets & Passes – Legacy Ticket Importer 1.0.0**
 
+| | |
+|---|---|
+| Version | 1.0.0 |
+| File | `tickets-passes-legacy-importer-1.0.0.zip` |
+| SHA-256 | `ead10d6a2ec581d0c8947519b0d6c323f6d89a9c0b3391a2e0b9193d0ff4f02b` |
+
 [⬇ Download the WordPress plugin](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)
+
+> Do not use GitHub's automatically generated **Source code** archives as the WordPress plugin package.
