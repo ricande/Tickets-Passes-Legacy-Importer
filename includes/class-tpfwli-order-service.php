@@ -4,8 +4,9 @@ defined('ABSPATH') || exit;
 /**
  * Creates or resumes a guest WooCommerce order for one legacy import ID.
  *
- * First save persists created_via (UUID in the order INSERT) plus immutable
- * snapshots. The Ticket line is added later by TPFWLI_Order_Shape.
+ * First-time bootstrap runs inside wc_transaction_query() so a crash cannot
+ * leave a wc_orders row without import identity or Ticket line. Resume of an
+ * already-committed order is unchanged and is not wrapped in that transaction.
  */
 final class TPFWLI_Order_Service
 {
@@ -43,15 +44,67 @@ final class TPFWLI_Order_Service
 			);
 		}
 
-		$order = new WC_Order();
-		$order->set_status('pending');
-		$order->set_customer_id(0);
-		$order->set_created_via(TPFWLI_Plugin::created_via($import_id));
-		$this->apply_billing($order, $customer);
-		$this->apply_snapshots($order, $import_id, $product, $quantity, $product_meta);
-		$order->save();
+		return $this->bootstrap_new($import_id, $customer, $product, $quantity, $product_meta);
+	}
 
-		$fresh = wc_get_order($order->get_id());
+	/**
+	 * First-time order + identity + Ticket line. Rolled back as one unit on failure.
+	 *
+	 * @param array<string,mixed> $customer
+	 * @param array<string,mixed> $product_meta
+	 * @return array{ok:bool,order:?WC_Order,created:bool,error:string}
+	 */
+	private function bootstrap_new(string $import_id, array $customer, WC_Product $product, int $quantity, array $product_meta): array
+	{
+		$order_id = 0;
+		wc_transaction_query('start');
+		try {
+			$order = wc_create_order(array(
+				'status'      => 'pending',
+				'customer_id' => 0,
+				'created_via' => TPFWLI_Plugin::created_via($import_id),
+			));
+			if (is_wp_error($order) || !$order instanceof WC_Order) {
+				$message = is_wp_error($order) ? $order->get_error_message() : '';
+				throw new RuntimeException(
+					$message !== '' ? $message : __('Could not create a WooCommerce order.', 'tickets-passes-legacy-importer')
+				);
+			}
+			$order_id = (int) $order->get_id();
+			if ($order_id < 1) {
+				throw new RuntimeException(__('Could not create a WooCommerce order.', 'tickets-passes-legacy-importer'));
+			}
+			$this->crash_checkpoint('after_order_id', $order);
+
+			$this->apply_billing($order, $customer);
+			$this->apply_snapshots($order, $import_id, $product, $quantity, $product_meta);
+			$order->save();
+			$this->crash_checkpoint('after_meta', $order);
+
+			$shaped = (new TPFWLI_Order_Shape())->assert_or_repair($order, $product, $quantity);
+			if (!$shaped['ok'] || !$shaped['order'] instanceof WC_Order) {
+				throw new RuntimeException(
+					$shaped['error'] !== '' ? $shaped['error'] : __('Could not add the Ticket product line.', 'tickets-passes-legacy-importer')
+				);
+			}
+			$order = $shaped['order'];
+			$this->crash_checkpoint('after_line', $order);
+
+			wc_transaction_query('commit');
+		} catch (Throwable $e) {
+			wc_transaction_query('rollback');
+			$this->forget_rolled_back_order($order_id);
+			return array(
+				'ok'      => false,
+				'order'   => null,
+				'created' => false,
+				'error'   => $e->getMessage() !== ''
+					? $e->getMessage()
+					: __('Could not create a WooCommerce order.', 'tickets-passes-legacy-importer'),
+			);
+		}
+
+		$fresh = wc_get_order($order_id);
 		if (!$fresh instanceof WC_Order) {
 			return array(
 				'ok'      => false,
@@ -67,6 +120,43 @@ final class TPFWLI_Order_Service
 			'created' => true,
 			'error'   => '',
 		);
+	}
+
+	private function crash_checkpoint(string $point, WC_Order $order): void
+	{
+		do_action('tpfwli_bootstrap_checkpoint', $point, $order);
+	}
+
+	private function forget_rolled_back_order(int $order_id): void
+	{
+		if ($order_id < 1) {
+			return;
+		}
+		wp_cache_delete($order_id, 'orders');
+		wp_cache_delete('order-' . $order_id, 'orders');
+		clean_post_cache($order_id);
+		if (function_exists('wc_delete_shop_order_transients')) {
+			wc_delete_shop_order_transients($order_id);
+		}
+		if (!function_exists('wc_get_container')) {
+			return;
+		}
+		try {
+			$store = wc_get_container()->get(\Automattic\WooCommerce\Internal\DataStores\Orders\OrdersTableDataStore::class);
+			if (is_object($store) && method_exists($store, 'clear_cached_data')) {
+				$store->clear_cached_data(array($order_id));
+			}
+		} catch (Throwable $ignored) {
+			unset($ignored);
+		}
+		try {
+			$cache = wc_get_container()->get(\Automattic\WooCommerce\Caches\OrderCache::class);
+			if (is_object($cache) && method_exists($cache, 'remove')) {
+				$cache->remove($order_id);
+			}
+		} catch (Throwable $ignored) {
+			unset($ignored);
+		}
 	}
 
 	public function set_stage(WC_Order $order, string $meta_key, string $value, string $note = ''): void

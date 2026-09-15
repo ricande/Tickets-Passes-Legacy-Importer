@@ -16,7 +16,7 @@ V1 is a single-row admin form. There is no CSV import, no public REST, no nopriv
 
 - WordPress ≥ 6.5 (developed against 7.1)
 - WooCommerce ≥ 8 (developed against **11.1.0**)
-- **WooCommerce HPOS must be on.** V1 will not run against legacy CPT order storage; crash-safe import identity depends on `created_via` in the HPOS order INSERT.
+- **WooCommerce HPOS must be on.** V1 will not run against legacy CPT order storage. First-time order bootstrap runs inside a MySQL transaction (`wc_transaction_query`) covering the HPOS order tables, import snapshots and the Ticket line.
 - Tickets & Passes for WooCommerce **≥ 1.3.0**, with the Ticket product type enabled
 
 ## Ticket product for this importer
@@ -43,7 +43,7 @@ Hidden fields are not trusted. Confirm always re-fetches product, price, stock a
 
 ## Retries
 
-The immutable **import ID** is the idempotency key (MySQL named lock + `created_via` on the first order INSERT + `_tpfwli_import_id` meta). A crash after the order row exists can be resumed; a missing Ticket line on a still-bootstrapping order is repaired. Extra, wrong, or quantity-drifted lines fail closed before stock.
+The immutable **import ID** is the idempotency key (MySQL named lock for concurrent requests, plus a MySQL transaction around first-time order bootstrap). A crash during bootstrap rolls the order back; Confirm with the same ID then creates exactly one order. `created_via` remains an extra lookup/audit field on committed orders. A missing Ticket line on a still-bootstrapping committed order is repaired. Extra, wrong, or quantity-drifted lines fail closed before stock.
 
 Result/overview reads WooCommerce + TPFW state, not the short-lived flash transient.
 

@@ -212,16 +212,17 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$body = (string) (self::$mail[0]['message'] ?? '');
 		$this->assertStringContainsString($first['nanos'][0], $body);
 		$this->assertStringContainsString($first['nanos'][1], $body);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		$this->assertSame(0, $this->adminMailCount((string) $input['email']));
 
 		$order_count_before = $this->count_import_orders();
-		$mail_before = count(self::$mail);
 		$second = (new TPFWLI_Orchestrator())->run($input, 'confirm');
 		$this->assertTrue($second['ok'] || $second['email_already'], implode('; ', $second['errors']));
 		$this->assertSame((int) $order->get_id(), (int) $second['order']->get_id());
 		$this->assertSame($order_count_before, $this->count_import_orders());
 		$this->assertSame($start_stock - 2, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
 		$this->assertSame($first['nanos'], $second['nanos']);
-		$this->assertSame($mail_before, count(self::$mail), 'already-sent import must not send a second normal email');
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']), 'already-sent import must not send a second customer email');
 
 		$issue_again = (new TPFWLI_Orchestrator())->run($input, 'retry_issue');
 		$this->assertSame($first['nanos'], $issue_again['nanos']);
@@ -252,6 +253,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame('failed', (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
 		$this->assertSame('not_sent', (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
 		$this->assertCount(0, self::$mail);
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
 		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
 
 		$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_issue');
@@ -261,7 +263,23 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertCount(2, $retry['nanos']);
 		$this->assertSame(2, $this->count_tickets_for_order((int) $order->get_id()));
 		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
-		$this->assertCount(1, self::$mail);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		$this->assertSame(0, $this->adminMailCount((string) $input['email']));
+	}
+
+	public function test_bootstrap_crash_after_order_id_rolls_back_and_retry_creates_exactly_one_order(): void
+	{
+		$this->assertBootstrapCrashThenRetry('after_order_id');
+	}
+
+	public function test_bootstrap_crash_after_meta_rolls_back_and_retry_creates_exactly_one_order(): void
+	{
+		$this->assertBootstrapCrashThenRetry('after_meta');
+	}
+
+	public function test_bootstrap_crash_after_line_rolls_back_and_retry_creates_exactly_one_order(): void
+	{
+		$this->assertBootstrapCrashThenRetry('after_line');
 	}
 
 	public function test_incomplete_bootstrap_created_via_is_resumed_as_one_order(): void
@@ -485,7 +503,8 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
 			$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
 			$this->assertSame($first['nanos'], $retry['nanos']);
-			$this->assertCount(1, self::$mail);
+			$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+			$this->assertSame(0, $this->adminMailCount((string) $input['email']));
 			$this->assertSame($stock_after_issue, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
 		} finally {
 			$product = wc_get_product(self::$ticket_id);
@@ -645,12 +664,13 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
 		$this->assertSame($result['nanos'], $retry['nanos']);
 		$this->assertSame($stock_after, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
-		$this->assertCount(1, self::$mail);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		$this->assertSame(0, $this->adminMailCount((string) $input['email']));
 
 		self::$mail = array();
 		$again = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
 		$this->assertTrue($again['email_already'] || $again['ok']);
-		$this->assertCount(0, self::$mail);
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
 	}
 
 	public function test_unknown_email_outcome_does_not_autoresend(): void
@@ -722,16 +742,220 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$adapter = new TPFWLI_Tpfw_Adapter();
 		$check = $adapter->validate_ticket_product((int) $input['product_id'], (int) $input['quantity'], false);
 		$this->assertTrue($check['ok'], implode('; ', $check['errors']));
-		$created = (new TPFWLI_Order_Service())->create_or_resume(
-			$input['import_id'],
-			$input,
-			$check['product'],
-			(int) $input['quantity'],
-			$check['meta']
+		$order = new WC_Order();
+		$order->set_status('pending');
+		$order->set_customer_id(0);
+		$order->set_created_via(TPFWLI_Plugin::created_via($input['import_id']));
+		$order->set_billing_first_name((string) $input['first_name']);
+		$order->set_billing_last_name((string) ($input['last_name'] ?? 'Andersson'));
+		$order->set_billing_email((string) $input['email']);
+		$order->set_billing_phone((string) ($input['phone'] ?? '0701234567'));
+		$order->update_meta_data(TPFWLI_Plugin::META_IMPORT, 'yes');
+		$order->update_meta_data(TPFWLI_Plugin::META_IMPORT_ID, $input['import_id']);
+		$order->update_meta_data(TPFWLI_Plugin::META_ORDER_STAGE, TPFWLI_Plugin::STAGE_BOOTSTRAPPING);
+		$order->update_meta_data(TPFWLI_Plugin::META_STOCK_STAGE, 'pending');
+		$order->update_meta_data(TPFWLI_Plugin::META_ISSUE_STAGE, 'pending');
+		$order->update_meta_data(TPFWLI_Plugin::META_EMAIL_STAGE, 'not_sent');
+		$order->update_meta_data(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID, (int) $input['product_id']);
+		$order->update_meta_data(TPFWLI_Plugin::META_EXPECTED_QUANTITY, (int) $input['quantity']);
+		$order->update_meta_data(TPFWLI_Plugin::META_EXPECTED_MAX_USES, (int) ($check['meta']['max_uses'] ?? 1));
+		$order->update_meta_data(TPFWLI_Plugin::META_EXPECTED_VALID_FROM, (string) ($check['meta']['valid_from'] ?? ''));
+		$order->update_meta_data(TPFWLI_Plugin::META_EXPECTED_VALID_TO, (string) ($check['meta']['valid_to'] ?? ''));
+		$order->save();
+		$fresh = wc_get_order($order->get_id());
+		$this->assertInstanceOf(WC_Order::class, $fresh);
+		return $fresh;
+	}
+
+	private function assertBootstrapCrashThenRetry(string $checkpoint): void
+	{
+		$this->assertHposTablesAreInnoDb();
+		$input = $this->valid_input(array(
+			'email'      => 'crash-' . $checkpoint . '@example.com',
+			'first_name' => 'Crash',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+
+		$seen_id = 0;
+		$hit     = false;
+		$crash   = function (string $point, $order) use ($checkpoint, &$seen_id, &$hit): void {
+			if (!$order instanceof WC_Order || $point !== $checkpoint) {
+				return;
+			}
+			$seen_id = (int) $order->get_id();
+			$hit     = true;
+			throw new RuntimeException('injected:' . $checkpoint);
+		};
+		add_action('tpfwli_bootstrap_checkpoint', $crash, 10, 2);
+		$failed = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		remove_action('tpfwli_bootstrap_checkpoint', $crash, 10);
+
+		$this->assertTrue($hit, 'checkpoint ' . $checkpoint . ' was not reached');
+		$this->assertGreaterThan(0, $seen_id);
+		$this->assertFalse($failed['ok']);
+		$this->assertNull($failed['order']);
+		$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+		$this->assertSame(0, $this->db_table_count($this->hpos_orders_table(), 'id', $seen_id));
+		$this->assertSame(0, $this->db_table_count($this->hpos_operational_table(), 'order_id', $seen_id));
+		$this->assertSame(0, $this->db_table_count($this->hpos_meta_table(), 'order_id', $seen_id));
+		$this->assertSame(0, $this->db_table_count($this->hpos_address_table(), 'order_id', $seen_id));
+		$this->assertSame(0, $this->db_table_count($this->order_items_table(), 'order_id', $seen_id));
+		global $wpdb;
+		$this->assertSame(0, (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->posts} WHERE ID = %d", $seen_id)));
+		$this->assertSame($start_stock, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertSame(0, $this->count_tickets_for_order($seen_id));
+
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		$this->assertInstanceOf(WC_Order::class, $retry['order']);
+		$final_id = (int) $retry['order']->get_id();
+		$this->assertNotSame($seen_id, $final_id);
+		$this->assertSame(array($final_id), $this->db_import_order_ids($input['import_id']));
+		$this->assertCount(1, $retry['order']->get_items('line_item'));
+		$this->assertSame(0, (int) $retry['order']->get_customer_id());
+		$this->assertSame($start_stock - 2, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertCount(2, $retry['nanos']);
+		$this->assertSame(2, $this->count_tickets_for_order($final_id));
+		$this->assertSame('sent', (string) $retry['order']->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		$this->assertSame(0, $this->adminMailCount((string) $input['email']));
+
+		$again = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertSame($final_id, (int) $again['order']->get_id());
+		$this->assertSame(array($final_id), $this->db_import_order_ids($input['import_id']));
+		$this->assertSame($start_stock - 2, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame($retry['nanos'], $again['nanos']);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+	}
+
+	private function assertHposTablesAreInnoDb(): void
+	{
+		global $wpdb;
+		$tables = array(
+			$this->hpos_orders_table(),
+			$this->hpos_operational_table(),
+			$this->hpos_address_table(),
+			$this->hpos_meta_table(),
+			$this->order_items_table(),
+			$wpdb->posts,
 		);
-		$this->assertTrue($created['ok'], $created['error']);
-		$this->assertInstanceOf(WC_Order::class, $created['order']);
-		return $created['order'];
+		foreach ($tables as $table) {
+			$engine = $wpdb->get_var($wpdb->prepare(
+				'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
+				$table
+			));
+			$this->assertSame('InnoDB', $engine, $table . ' must be InnoDB for bootstrap transactions');
+		}
+	}
+
+	/**
+	 * @return int[]
+	 */
+	private function db_import_order_ids(string $import_id): array
+	{
+		global $wpdb;
+		$via = TPFWLI_Plugin::created_via($import_id);
+		$ids = $wpdb->get_col($wpdb->prepare(
+			'SELECT DISTINCT o.id FROM ' . $this->hpos_orders_table() . ' o
+			LEFT JOIN ' . $this->hpos_operational_table() . ' od ON od.order_id = o.id
+			LEFT JOIN ' . $this->hpos_meta_table() . ' m ON m.order_id = o.id AND m.meta_key = %s
+			WHERE od.created_via = %s OR m.meta_value = %s
+			ORDER BY o.id ASC',
+			TPFWLI_Plugin::META_IMPORT_ID,
+			$via,
+			$import_id
+		));
+		if (!is_array($ids)) {
+			return array();
+		}
+		return array_map('intval', $ids);
+	}
+
+	private function db_table_count(string $table, string $column, int $order_id): int
+	{
+		global $wpdb;
+		$sql = 'SELECT COUNT(*) FROM `' . str_replace('`', '', $table) . '` WHERE `' . str_replace('`', '', $column) . '` = %d';
+		return (int) $wpdb->get_var($wpdb->prepare($sql, $order_id));
+	}
+
+	private function hpos_orders_table(): string
+	{
+		global $wpdb;
+		return $wpdb->prefix . 'wc_orders';
+	}
+
+	private function hpos_operational_table(): string
+	{
+		global $wpdb;
+		return $wpdb->prefix . 'wc_order_operational_data';
+	}
+
+	private function hpos_address_table(): string
+	{
+		global $wpdb;
+		return $wpdb->prefix . 'wc_order_addresses';
+	}
+
+	private function hpos_meta_table(): string
+	{
+		global $wpdb;
+		return $wpdb->prefix . 'wc_orders_meta';
+	}
+
+	private function order_items_table(): string
+	{
+		global $wpdb;
+		return $wpdb->prefix . 'woocommerce_order_items';
+	}
+
+	/**
+	 * wp_mail calls whose To-list includes the import billing address.
+	 */
+	private function customerMailCount(string $billing): int
+	{
+		$billing = strtolower($billing);
+		$count = 0;
+		foreach (self::$mail as $atts) {
+			if ($this->mailToContains($atts, $billing)) {
+				$count++;
+			}
+		}
+		return $count;
+	}
+
+	/**
+	 * Admin/internal wp_mail that did not also target the billing address.
+	 */
+	private function adminMailCount(string $billing): int
+	{
+		$billing = strtolower($billing);
+		$admin = strtolower((string) get_option('admin_email'));
+		if ($admin === '' || $admin === $billing) {
+			return 0;
+		}
+		$count = 0;
+		foreach (self::$mail as $atts) {
+			if ($this->mailToContains($atts, $admin) && !$this->mailToContains($atts, $billing)) {
+				$count++;
+			}
+		}
+		return $count;
+	}
+
+	/**
+	 * @param array<string,mixed> $atts
+	 */
+	private function mailToContains(array $atts, string $needle): bool
+	{
+		$to = $atts['to'] ?? '';
+		if (is_array($to)) {
+			$to = implode(',', $to);
+		}
+		$tos = array_map('trim', explode(',', strtolower((string) $to)));
+		return in_array($needle, $tos, true);
 	}
 
 	private function count_import_orders(): int

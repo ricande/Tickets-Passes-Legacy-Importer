@@ -5,8 +5,9 @@ defined('ABSPATH') || exit;
  * HPOS-safe lookup of importer orders via wc_get_orders().
  *
  * Identity is the import UUID. Meta `_tpfwli_import_id` is canonical once present.
- * `created_via` is the first-INSERT fallback so a crash after the order row exists
- * but before meta is written cannot produce an unidentifiable orphan.
+ * `created_via` is an extra lookup/audit key for committed orders. Crash safety
+ * for first-time create is the MySQL transaction in TPFWLI_Order_Service, not
+ * the assumption that created_via lands in the first HPOS INSERT.
  */
 final class TPFWLI_Import_Repository
 {
