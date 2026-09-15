@@ -4,13 +4,13 @@ Temporary **admin-only** WordPress plugin. It turns one already-paid historical 
 
 It is **not** part of Tickets & Passes for WooCommerce. Do not install it on production until you have run it against a disposable copy of the shop.
 
-[![Release](https://img.shields.io/github/v/release/ricande/Tickets-Passes-Legacy-Importer?label=release)](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/tag/1.0.0)
+[![Release](https://img.shields.io/github/v/release/ricande/Tickets-Passes-Legacy-Importer?label=release)](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/tag/1.0.1)
 [![WordPress](https://img.shields.io/badge/WordPress-6.5%2B-21759b)](https://wordpress.org)
 [![WooCommerce](https://img.shields.io/badge/WooCommerce-HPOS-7f54b3)](https://woocommerce.com)
 [![PHP](https://img.shields.io/badge/PHP-8.0%2B-777bb4)](https://www.php.net)
 [![License](https://img.shields.io/badge/license-GPLv2%2B-blue.svg)](LICENSE)
 
-[**Download 1.0.0**](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)
+[**Download 1.0.1**](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.1/tickets-passes-legacy-importer-1.0.1.zip)
 · [Report an issue](https://github.com/ricande/Tickets-Passes-Legacy-Importer/issues/new)
 
 Shop-owner install notes also live in [`readme.txt`](readme.txt). How tests vs the WordPress zip are split: [`docs/release.md`](docs/release.md).
@@ -122,14 +122,14 @@ GPLv2 or later. See [`LICENSE`](LICENSE).
 
 Use the WordPress plugin zip from the GitHub Release — not GitHub’s automatically generated **Source code** archive.
 
-**Tickets & Passes – Legacy Ticket Importer 1.0.0**
+**Tickets & Passes – Legacy Ticket Importer 1.0.1**
 
 | | |
 |---|---|
-| Version | 1.0.0 |
-| File | `tickets-passes-legacy-importer-1.0.0.zip` |
-| SHA-256 | `7676d290276ac9fa0f0f732b639daf1b928790ee2d6de68b8a04be4a414fbc66` |
+| Version | 1.0.1 |
+| File | `tickets-passes-legacy-importer-1.0.1.zip` |
+| SHA-256 | `e85d61f7d0279ce38efadd9233707fa682056d552df658e63b336c1569a0643a` |
 
-[⬇ Download the WordPress plugin](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.0/tickets-passes-legacy-importer-1.0.0.zip)
+[⬇ Download the WordPress plugin](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/download/1.0.1/tickets-passes-legacy-importer-1.0.1.zip)
 
 > Do not use GitHub's automatically generated **Source code** archives as the WordPress plugin package.

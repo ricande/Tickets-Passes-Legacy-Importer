@@ -5,7 +5,7 @@ Requires at least: 6.5
 Tested up to: 7.1
 Requires PHP: 8.0
 Requires Plugins: woocommerce
-Stable tag: 1.0.0
+Stable tag: 1.0.1
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -26,6 +26,9 @@ WooCommerce **HPOS must be on**. Tickets & Passes for WooCommerce 1.3.0 or newer
 3. Open WooCommerce → Legacy Ticket Importer.
 
 == Changelog ==
+
+= 1.0.1 =
+* Qualified implementation release for legacy ticket migration: atomic HPOS order bootstrap, crash-safe retry, strict order shape before stock, product-config snapshot protection, email-retry correctness and POST-only mutations.
 
 = 1.0.0 =
 * Initial release.

@@ -18,7 +18,7 @@ Requires the local WordPress path (default `/var/www/woocommerce`) with WooComme
 bash scripts/build-plugin-zip.sh
 ```
 
-Writes `dist/tickets-passes-legacy-importer-1.0.0.zip` (version from the plugin header). Optional: `TPFWLI_ZIP_OUT=/tmp/plugin.zip`.
+Writes `dist/tickets-passes-legacy-importer-<version>.zip` (version from the plugin header). Optional: `TPFWLI_ZIP_OUT=/tmp/plugin.zip`.
 
 Top folder inside the zip: `tickets-passes-legacy-importer/`.
 
