@@ -2,14 +2,14 @@
 /**
  * Boot the local WordPress install so importer tests run against real WooCommerce + TPFW.
  */
-$wp = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
-if (!is_readable($wp . '/wp-load.php')) {
-	fwrite(STDERR, "WordPress not found at {$wp}. Set TPFWLI_WP_PATH.\n");
+$wp_root = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
+if (!is_readable($wp_root . '/wp-load.php')) {
+	fwrite(STDERR, "WordPress not found at {$wp_root}. Set TPFWLI_WP_PATH.\n");
 	exit(1);
 }
 
 define('WP_USE_THEMES', false);
-require $wp . '/wp-load.php';
+require $wp_root . '/wp-load.php';
 
 if (!class_exists('WooCommerce') || !defined('TPFW_VERSION')) {
 	fwrite(STDERR, "WooCommerce and Tickets & Passes for WooCommerce must be active.\n");

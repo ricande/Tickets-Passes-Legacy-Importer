@@ -58,6 +58,12 @@ final class TPFWLI_Tpfw_Adapter
 	 */
 	public function force_issue(int $order_id): bool
 	{
+		$allowed = apply_filters('tpfwli_allow_force_issue', true, $order_id);
+		if (!$allowed) {
+			$this->last_error = __('Ticket issue was blocked before TPFW force-issue ran.', 'tickets-passes-legacy-importer');
+			return false;
+		}
+
 		$runtime = $this->find_runtime();
 		if (!$runtime) {
 			return false;
@@ -104,8 +110,8 @@ final class TPFWLI_Tpfw_Adapter
 		if ($start_enable !== 'yes') {
 			$errors[] = __('This importer V1 requires a fixed event window. Enable the predefined start date on the Ticket product.', 'tickets-passes-legacy-importer');
 		}
-		if ($start_enable === 'yes' && !preg_match('/^\d{4}-\d{2}-\d{2}$/', $start_date)) {
-			$errors[] = __('The Ticket product predefined start date must be a valid Y-m-d date.', 'tickets-passes-legacy-importer');
+		if ($start_enable === 'yes' && !$this->is_strict_ymd($start_date)) {
+			$errors[] = __('The Ticket product predefined start date must be a real calendar date in Y-m-d format.', 'tickets-passes-legacy-importer');
 		}
 		if ($duration <= 0) {
 			$errors[] = __('The Ticket product is missing a valid duration (seconds).', 'tickets-passes-legacy-importer');
@@ -116,9 +122,10 @@ final class TPFWLI_Tpfw_Adapter
 
 		$valid_from = '';
 		$valid_to   = '';
-		if ($start_enable === 'yes' && preg_match('/^\d{4}-\d{2}-\d{2}$/', $start_date) && $duration > 0) {
-			$valid_from = gmdate('Y-m-d H:i:s', strtotime($start_date));
-			$valid_to   = gmdate('Y-m-d H:i:s', strtotime($start_date) + $duration);
+		if ($start_enable === 'yes' && $this->is_strict_ymd($start_date) && $duration > 0) {
+			$midnight = gmmktime(0, 0, 0, (int) substr($start_date, 5, 2), (int) substr($start_date, 8, 2), (int) substr($start_date, 0, 4));
+			$valid_from = gmdate('Y-m-d H:i:s', $midnight);
+			$valid_to   = gmdate('Y-m-d H:i:s', $midnight + $duration);
 		}
 
 		$date_format = $this->tpfw_date_format();
@@ -181,7 +188,36 @@ final class TPFWLI_Tpfw_Adapter
 	}
 
 	/**
+	 * Compare the live Ticket product against the import's locked issue snapshot.
+	 *
+	 * @return array{ok:bool,errors:string[]}
+	 */
+	public function current_matches_snapshot(WC_Product $product, WC_Order $order): array
+	{
+		$expected_max  = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_MAX_USES);
+		$expected_from = (string) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_VALID_FROM);
+		$expected_to   = (string) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_VALID_TO);
+		$quantity      = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_QUANTITY);
+		$check         = $this->validate_ticket_product((int) $product->get_id(), max(1, $quantity), false);
+		if (!$check['ok']) {
+			return array('ok' => false, 'errors' => $check['errors']);
+		}
+
+		$errors = array();
+		if ((int) $check['meta']['max_uses'] !== $expected_max
+			|| (string) $check['meta']['valid_from'] !== $expected_from
+			|| (string) $check['meta']['valid_to'] !== $expected_to) {
+			$errors[] = __('The Ticket product validity or max uses changed after this import was confirmed. Ticket issue was not run.', 'tickets-passes-legacy-importer');
+		}
+
+		return array('ok' => $errors === array(), 'errors' => $errors);
+	}
+
+	/**
 	 * Read-only verification that TPFW issued exactly $quantity live tickets.
+	 *
+	 * After issue, tickets are compared to the import snapshot — not to a product
+	 * that may have been edited later.
 	 *
 	 * @return array{ok:bool,errors:string[],nanos:string[],count:int}
 	 */
@@ -202,12 +238,24 @@ final class TPFWLI_Tpfw_Adapter
 		$product_id = (int) $item->get_product_id();
 		$line_id    = (int) $item->get_id();
 		$order_id   = (int) $order->get_id();
+		$expected_product = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID);
+		$expected_max     = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_MAX_USES);
+		$expected_from    = (string) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_VALID_FROM);
+		$expected_to      = (string) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_VALID_TO);
 
-		$product_check = $this->validate_ticket_product($product_id, $quantity, false);
-		if (!$product_check['ok']) {
+		if ($expected_product > 0 && $product_id !== $expected_product) {
 			return array(
 				'ok'     => false,
-				'errors' => $product_check['errors'],
+				'errors' => array(__('Order line product does not match the locked import product.', 'tickets-passes-legacy-importer')),
+				'nanos'  => array(),
+				'count'  => 0,
+			);
+		}
+
+		if ($expected_max < 1 || $expected_from === '' || $expected_to === '') {
+			return array(
+				'ok'     => false,
+				'errors' => array(__('This importer order is missing its locked validity snapshot.', 'tickets-passes-legacy-importer')),
 				'nanos'  => array(),
 				'count'  => 0,
 			);
@@ -238,12 +286,12 @@ final class TPFWLI_Tpfw_Adapter
 			if ((int) $row->product_id !== $product_id || (int) $row->order_id !== $order_id || (int) $row->order_line_id !== $line_id) {
 				$errors[] = __('A ticket row does not match the order line.', 'tickets-passes-legacy-importer');
 			}
-			if ((int) $row->max_uses !== (int) $product_check['meta']['max_uses']) {
-				$errors[] = __('A ticket row max_uses does not match the product.', 'tickets-passes-legacy-importer');
+			if ((int) $row->max_uses !== $expected_max) {
+				$errors[] = __('A ticket row max_uses does not match the locked import snapshot.', 'tickets-passes-legacy-importer');
 			}
-			if ((string) $row->valid_from !== (string) $product_check['meta']['valid_from']
-				|| (string) $row->valid_to !== (string) $product_check['meta']['valid_to']) {
-				$errors[] = __('A ticket validity window does not match the product fixed event dates.', 'tickets-passes-legacy-importer');
+			if ((string) $row->valid_from !== $expected_from
+				|| (string) $row->valid_to !== $expected_to) {
+				$errors[] = __('A ticket validity window does not match the locked import snapshot.', 'tickets-passes-legacy-importer');
 			}
 		}
 
@@ -301,6 +349,14 @@ final class TPFWLI_Tpfw_Adapter
 			'nanos'  => $nanos,
 			'count'  => $count,
 		);
+	}
+
+	public function is_strict_ymd(string $date): bool
+	{
+		if (!preg_match('/^(\d{4})-(\d{2})-(\d{2})$/', $date, $parts)) {
+			return false;
+		}
+		return checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1]);
 	}
 
 	private function instance_from_hook(string $hook, string $method)

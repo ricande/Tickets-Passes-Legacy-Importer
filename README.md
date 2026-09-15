@@ -42,7 +42,9 @@ Hidden fields are not trusted. Confirm always re-fetches product, price, stock a
 
 ## Retries
 
-The immutable **import ID** is the idempotency key (MySQL named lock + order meta).
+The immutable **import ID** is the idempotency key (MySQL named lock + `created_via` on the first order INSERT + `_tpfwli_import_id` meta). A crash after the order row exists can be resumed; a missing Ticket line on a still-bootstrapping order is repaired. Extra, wrong, or quantity-drifted lines fail closed before stock.
+
+Result/overview reads WooCommerce + TPFW state, not the short-lived flash transient.
 
 | Failed step | Button | Will not do |
 |---|---|---|

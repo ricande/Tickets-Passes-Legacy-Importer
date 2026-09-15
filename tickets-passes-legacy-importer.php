@@ -21,6 +21,34 @@ define('TPFWLI_MIN_TPFW', '1.3.0');
 
 require_once TPFWLI_PLUGIN_DIR . 'includes/class-tpfwli-plugin.php';
 
+register_activation_hook(TPFWLI_PLUGIN_FILE, 'tpfwli_activate');
+
+/**
+ * Activation must not fatal. WooCommerce and TPFW are required; hook registry is
+ * re-checked at runtime because plugins can be deactivated later.
+ */
+function tpfwli_activate(): void
+{
+	if (!class_exists('TPFWLI_Dependencies')) {
+		require_once TPFWLI_PLUGIN_DIR . 'includes/class-tpfwli-dependencies.php';
+	}
+
+	$problems = TPFWLI_Dependencies::problems(false);
+	if ($problems === array()) {
+		return;
+	}
+
+	if (function_exists('deactivate_plugins')) {
+		deactivate_plugins(plugin_basename(TPFWLI_PLUGIN_FILE));
+	}
+
+	wp_die(
+		esc_html(implode(' ', $problems)),
+		esc_html__('Tickets & Passes – Legacy Ticket Importer', 'tickets-passes-legacy-importer'),
+		array('back_link' => true, 'response' => 200)
+	);
+}
+
 add_action('plugins_loaded', static function () {
 	TPFWLI_Plugin::instance()->boot();
 }, 20);

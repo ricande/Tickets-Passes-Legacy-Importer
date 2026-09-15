@@ -26,6 +26,25 @@ final class TPFWLI_Stock_Service
 	 */
 	public function reduce_if_needed(WC_Order $order, WC_Product $product, int $quantity): array
 	{
+		$items = array_values($order->get_items('line_item'));
+		if (count($items) !== 1) {
+			return array(
+				'ok'            => false,
+				'error'         => __('Order shape is not ready for stock reduction.', 'tickets-passes-legacy-importer'),
+				'current_stock' => $product->get_stock_quantity(),
+				'reduced_qty'   => 0,
+			);
+		}
+		if ((int) $items[0]->get_product_id() !== (int) $product->get_id()
+			|| (int) $items[0]->get_quantity() !== $quantity) {
+			return array(
+				'ok'            => false,
+				'error'         => __('Order line does not match the locked product and quantity; stock was not reduced.', 'tickets-passes-legacy-importer'),
+				'current_stock' => $product->get_stock_quantity(),
+				'reduced_qty'   => 0,
+			);
+		}
+
 		if ($this->is_reduced($order)) {
 			$fresh = wc_get_product($product->get_id());
 			return array(
@@ -93,5 +112,18 @@ final class TPFWLI_Stock_Service
 			$qty += (int) $item->get_meta('_reduced_stock', true);
 		}
 		return $qty;
+	}
+
+	public function accounted_label(WC_Order $order): string
+	{
+		if (!$this->is_reduced($order)) {
+			return __('not reduced', 'tickets-passes-legacy-importer');
+		}
+		$expected = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_QUANTITY);
+		$actual   = $this->reduced_qty($order);
+		if ($expected > 0 && $actual === $expected) {
+			return (string) $actual;
+		}
+		return __('Stock state inconsistent', 'tickets-passes-legacy-importer');
 	}
 }

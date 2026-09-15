@@ -9,7 +9,7 @@ final class TPFWLI_Dependencies
 	/**
 	 * @return string[] Human-readable problems. Empty means ready.
 	 */
-	public static function problems(): array
+	public static function problems(bool $require_runtime_hooks = true): array
 	{
 		$problems = array();
 
@@ -33,7 +33,7 @@ final class TPFWLI_Dependencies
 			}
 		}
 
-		if (class_exists('WooCommerce') && class_exists('TPFW_Ticket_WC_Product')) {
+		if ($require_runtime_hooks && class_exists('WooCommerce') && class_exists('TPFW_Ticket_WC_Product')) {
 			$adapter = new TPFWLI_Tpfw_Adapter();
 			if (!$adapter->find_runtime()) {
 				$problems[] = $adapter->last_error() !== ''
@@ -45,8 +45,8 @@ final class TPFWLI_Dependencies
 		return $problems;
 	}
 
-	public static function ready(): bool
+	public static function ready(bool $require_runtime_hooks = true): bool
 	{
-		return self::problems() === array();
+		return self::problems($require_runtime_hooks) === array();
 	}
 }

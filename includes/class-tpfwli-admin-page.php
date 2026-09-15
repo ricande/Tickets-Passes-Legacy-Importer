@@ -251,7 +251,7 @@ final class TPFWLI_Admin_Page
 			$order = wc_get_order($flash['order']->get_id());
 		} elseif (!empty($_GET['order_id'])) {
 			$order = wc_get_order(absint($_GET['order_id']));
-			if ($order && $order->get_meta(TPFWLI_Plugin::META_IMPORT) !== 'yes') {
+			if ($order && !$this->is_importer_order($order)) {
 				$order = null;
 			}
 		}
@@ -262,46 +262,41 @@ final class TPFWLI_Admin_Page
 		}
 
 		$errors = is_array($flash) ? ($flash['errors'] ?? array()) : array();
-		$nanos  = is_array($flash) ? ($flash['nanos'] ?? array()) : array();
+		$state  = $this->orchestrator->inspect($order);
+		$nanos  = $state['nanos'];
 		foreach ($errors as $error) {
 			echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
 		}
 
-		$stock_stage = (string) $order->get_meta(TPFWLI_Plugin::META_STOCK_STAGE);
-		$issue_stage = (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE);
-		$email_stage = (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE);
-		$qty = 0;
-		$product_name = '';
-		foreach ($order->get_items('line_item') as $item) {
-			$qty += (int) $item->get_quantity();
-			$product_name = $item->get_name();
-		}
-		$product = null;
-		foreach ($order->get_items('line_item') as $item) {
-			$product = wc_get_product($item->get_product_id());
-			break;
-		}
+		$stock_stage  = $state['stock_stage'];
+		$issue_stage  = $state['issue_stage'];
+		$email_stage  = $state['email_stage'];
+		$qty          = (int) $state['quantity'];
+		$product_name = (string) $state['product_name'];
 
 		echo '<table class="widefat striped"><tbody>';
 		$this->kv(__('Order created', 'tickets-passes-legacy-importer'), '#' . $order->get_id());
-		$this->kv(__('Legacy import ID', 'tickets-passes-legacy-importer'), (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		$this->kv(__('Legacy import ID', 'tickets-passes-legacy-importer'), $state['import_id']);
 		$this->kv(__('Product', 'tickets-passes-legacy-importer'), $product_name);
-		$this->kv(__('Stock accounted for this order', 'tickets-passes-legacy-importer'), (string) (is_array($flash) ? ($flash['stock_qty'] ?? $qty) : $qty));
-		$this->kv(__('Current stock', 'tickets-passes-legacy-importer'), $product ? (string) $product->get_stock_quantity() : '—');
+		$this->kv(__('Stock accounted for this order', 'tickets-passes-legacy-importer'), $state['stock_label']);
+		$this->kv(__('Current stock', 'tickets-passes-legacy-importer'), $state['current_stock'] !== null ? (string) $state['current_stock'] : '—');
 		$this->kv(__('Tickets issued', 'tickets-passes-legacy-importer'), count($nanos) . ' / ' . $qty . ' (' . $issue_stage . ')');
+		if ($nanos) {
+			$this->kv(__('Nano IDs', 'tickets-passes-legacy-importer'), implode(', ', $nanos));
+		}
 		$this->kv(__('Email', 'tickets-passes-legacy-importer'), $email_stage);
 		$this->kv(__('Recipient', 'tickets-passes-legacy-importer'), $order->get_billing_email());
 		$this->kv(__('Stock stage', 'tickets-passes-legacy-importer'), $stock_stage);
 		echo '</tbody></table>';
 
 		$input = array(
-			'product_id' => $product ? $product->get_id() : 0,
+			'product_id' => (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID),
 			'first_name' => $order->get_billing_first_name(),
 			'last_name'  => $order->get_billing_last_name(),
 			'email'      => $order->get_billing_email(),
 			'phone'      => $order->get_billing_phone(),
-			'quantity'   => $qty,
-			'import_id'  => (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID),
+			'quantity'   => $qty > 0 ? $qty : 1,
+			'import_id'  => $state['import_id'],
 		);
 
 		if ($issue_stage !== 'issued') {
@@ -365,6 +360,18 @@ final class TPFWLI_Admin_Page
 		}
 		submit_button($label);
 		echo '</form>';
+	}
+
+	private function is_importer_order(WC_Order $order): bool
+	{
+		if ($order->get_meta(TPFWLI_Plugin::META_IMPORT) === 'yes') {
+			return true;
+		}
+		if ((string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID) !== '') {
+			return true;
+		}
+		$via = (string) $order->get_created_via();
+		return str_starts_with($via, TPFWLI_Plugin::CREATED_VIA_PREFIX . ':');
 	}
 
 	private function text_row(string $name, string $label, string $value, string $type = 'text'): void
