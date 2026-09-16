@@ -1,8 +1,8 @@
 # Tickets & Passes – Legacy Ticket Importer
 
-Temporary **admin-only** WordPress plugin. It turns one already-paid historical ticket sale into a real WooCommerce guest order, lets **Tickets & Passes for WooCommerce** issue the QR tickets on its normal path, then emails the customer.
+Temporary **admin-only** WordPress plugin. It turns one already-paid historical ticket sale into a real WooCommerce guest order, lets **[Tickets & Passes for WooCommerce](https://github.com/ricande/Tickets-Passes-for-WooCommerce)** issue the QR tickets on its normal path, then emails the customer.
 
-It is **not** part of Tickets & Passes for WooCommerce. Do not install it on production until you have run it against a disposable copy of the shop.
+It is **not** part of [Tickets & Passes for WooCommerce](https://github.com/ricande/Tickets-Passes-for-WooCommerce). Do not install it on production until you have run it against a disposable copy of the shop.
 
 [![Release](https://img.shields.io/github/v/release/ricande/Tickets-Passes-Legacy-Importer?label=release)](https://github.com/ricande/Tickets-Passes-Legacy-Importer/releases/tag/1.0.1)
 [![WordPress](https://img.shields.io/badge/WordPress-6.5%2B-21759b)](https://wordpress.org)
@@ -28,7 +28,7 @@ V1 is a single-row admin form. There is no CSV import, no public REST, no nopriv
 - WordPress ≥ 6.5 (developed against 7.1)
 - WooCommerce ≥ 8 (developed against **11.1.0**)
 - **WooCommerce HPOS must be on.** V1 will not run against legacy CPT order storage. First-time order bootstrap runs inside a MySQL transaction (`wc_transaction_query`) covering the HPOS order tables, import snapshots and the Ticket line.
-- Tickets & Passes for WooCommerce **≥ 1.3.0**, with the Ticket product type enabled
+- [Tickets & Passes for WooCommerce](https://github.com/ricande/Tickets-Passes-for-WooCommerce) **≥ 1.3.0**, with the Ticket product type enabled
 
 ## Ticket product for this importer
 
