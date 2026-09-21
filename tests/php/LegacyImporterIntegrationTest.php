@@ -1753,6 +1753,354 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertCount(0, self::$mail);
 	}
 
+	public function test_cancelled_order_after_stock_is_not_resumed_by_any_mode(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-cancel@example.com',
+			'first_name' => 'LifeCancel',
+			'quantity'   => '2',
+		));
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$blocker = static function () {
+			return false;
+		};
+		add_filter('tpfwli_allow_force_issue', $blocker);
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		remove_filter('tpfwli_allow_force_issue', $blocker);
+		$this->assertFalse($first['ok']);
+		$order = $first['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$order->update_status('cancelled', 'test cancel after stock', true);
+		$this->assertSame('cancelled', wc_get_order($order->get_id())->get_status());
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertLifecycleBlocked($input, $order, $start_stock, $this->count_import_orders(), 'cancelled');
+	}
+
+	public function test_failed_refunded_and_trash_orders_are_not_resumed(): void
+	{
+		foreach (array('failed' => 'failed', 'refunded' => 'refund', 'trash' => 'trash') as $status => $needle) {
+			$input = $this->valid_input(array(
+				'email'      => 'life-' . $status . '@example.com',
+				'first_name' => 'Life' . ucfirst($status),
+				'quantity'   => '1',
+			));
+			$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertTrue($first['ok'], $status . ' setup: ' . implode('; ', $first['errors']));
+			$order = $first['order'];
+			$this->assertInstanceOf(WC_Order::class, $order);
+			$order_id = (int) $order->get_id();
+			if ($status === 'trash') {
+				$order->delete(false);
+			} else {
+				$order->update_status($status, 'test ' . $status, true);
+			}
+			$fresh = wc_get_order($order_id);
+			if (!$fresh instanceof WC_Order && $status === 'trash') {
+				$fresh = $order;
+			}
+			$this->assertInstanceOf(WC_Order::class, $fresh);
+			$this->assertSame($status, $fresh->get_status(), $status);
+			self::$mail = array();
+			$this->assertLifecycleBlocked($input, $fresh, $this->db_product_stock(self::$ticket_id), $this->count_import_orders(), $needle);
+		}
+	}
+
+	public function test_partial_refund_blocks_all_resume_modes(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-partial-refund@example.com',
+			'first_name' => 'LifePartial',
+			'quantity'   => '2',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = $first['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$refund = wc_create_refund(array(
+			'order_id'       => $order->get_id(),
+			'amount'         => '1',
+			'reason'         => 'test partial refund',
+			'refund_payment' => false,
+			'restock_items'  => false,
+		));
+		$this->assertInstanceOf(WC_Order_Refund::class, $refund);
+		self::$mail = array();
+		$this->assertLifecycleBlocked($input, wc_get_order($order->get_id()), $start_stock, $this->count_import_orders(), 'refund');
+	}
+
+	public function test_custom_order_status_is_not_automatically_resumable(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-custom@example.com',
+			'first_name' => 'LifeCustom',
+			'quantity'   => '1',
+		));
+		$register = static function (array $statuses): array {
+			$statuses['wc-tpfwli-custom'] = 'TPFWLI custom';
+			return $statuses;
+		};
+		add_filter('wc_order_statuses', $register);
+		try {
+			$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+			$order = $first['order'];
+			$this->assertInstanceOf(WC_Order::class, $order);
+			$order->update_status('tpfwli-custom', 'test custom status', true);
+			wp_cache_flush();
+			$fresh = wc_get_order($order->get_id());
+			$this->assertSame('tpfwli-custom', $fresh->get_status());
+			global $wpdb;
+			$stored = (string) $wpdb->get_var($wpdb->prepare(
+				"SELECT status FROM {$wpdb->prefix}wc_orders WHERE id = %d",
+				$order->get_id()
+			));
+			$this->assertTrue(
+				in_array($stored, array('tpfwli-custom', 'wc-tpfwli-custom'), true),
+				'stored status ' . $stored
+			);
+			$life = TPFWLI_Order_Lifecycle::assess($fresh);
+			$this->assertFalse($life['ok'], wp_json_encode($life));
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertInstanceOf(WC_Order::class, $found['order']);
+			$this->assertSame((int) $order->get_id(), (int) $found['order']->get_id());
+			$this->assertSame('tpfwli-custom', $found['order']->get_status());
+			self::$mail = array();
+			$this->assertLifecycleBlocked($input, $fresh, $this->db_product_stock(self::$ticket_id), $this->count_import_orders(), 'tpfwli-custom');
+		} finally {
+			remove_filter('wc_order_statuses', $register);
+		}
+	}
+
+	public function test_hook_cancel_between_stock_and_issue_stops_without_tickets(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-hook-stock@example.com',
+			'first_name' => 'LifeHookStock',
+			'quantity'   => '2',
+		));
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$cancel = static function (string $point, $order) {
+			if ($point !== 'after_commit' || !$order instanceof WC_Order) {
+				return;
+			}
+			$fresh = wc_get_order($order->get_id());
+			if ($fresh instanceof WC_Order) {
+				$fresh->update_status('cancelled', 'hook cancel after stock', true);
+			}
+		};
+		add_action('tpfwli_stock_checkpoint', $cancel, 10, 2);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $cancel, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$order = $result['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('cancelled', wc_get_order($order->get_id())->get_status());
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+	}
+
+	public function test_hook_cancel_after_issued_stops_before_completed_and_email(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-hook-issued@example.com',
+			'first_name' => 'LifeHookIssued',
+			'quantity'   => '2',
+		));
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$cancel = static function (string $point, $order) {
+			if ($point !== 'after_issued' || !$order instanceof WC_Order) {
+				return;
+			}
+			$fresh = wc_get_order($order->get_id());
+			if ($fresh instanceof WC_Order) {
+				$fresh->update_status('cancelled', 'hook cancel after issued', true);
+			}
+		};
+		add_action('tpfwli_lifecycle_checkpoint', $cancel, 10, 2);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_lifecycle_checkpoint', $cancel, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$order = $result['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$fresh = wc_get_order($order->get_id());
+		$this->assertSame('cancelled', $fresh->get_status());
+		$this->assertSame('issued', (string) $fresh->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame('not_sent', (string) $fresh->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+	}
+
+	public function test_hook_cancel_after_completed_stops_before_email(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-hook-completed@example.com',
+			'first_name' => 'LifeHookCompleted',
+			'quantity'   => '1',
+		));
+		$cancel = static function (string $point, $order) {
+			if ($point !== 'after_completed' || !$order instanceof WC_Order) {
+				return;
+			}
+			$fresh = wc_get_order($order->get_id());
+			if ($fresh instanceof WC_Order) {
+				$fresh->update_status('cancelled', 'hook cancel after completed', true);
+			}
+		};
+		add_action('tpfwli_lifecycle_checkpoint', $cancel, 10, 2);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_lifecycle_checkpoint', $cancel, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$order = $result['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('cancelled', wc_get_order($order->get_id())->get_status());
+		$this->assertSame('issued', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame('not_sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_abort_after_issued_can_be_finished_without_new_stock_or_tickets(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-after-issued@example.com',
+			'first_name' => 'LifeAfterIssued',
+			'quantity'   => '2',
+		));
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$abort = static function (string $point) {
+			if ($point === 'after_issued') {
+				throw new RuntimeException('lifecycle-checkpoint:after_issued');
+			}
+		};
+		add_action('tpfwli_lifecycle_checkpoint', $abort, 10, 1);
+		try {
+			(new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->fail('confirm should abort after issued');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('after_issued', $e->getMessage());
+		} finally {
+			remove_action('tpfwli_lifecycle_checkpoint', $abort, 10);
+		}
+		$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$order = $found['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('pending', $order->get_status());
+		$this->assertSame('issued', (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame('not_sent', (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$nanos = (new TPFWLI_Orchestrator())->inspect($order)['nanos'];
+		$this->assertCount(2, $nanos);
+		$html = $this->adminResultHtml($order);
+		$this->assertStringContainsString('tpfwli_resume', $html);
+		$this->assertStringContainsString('Finish issued import', $html);
+		$this->assertStringNotContainsString('tpfwli_retry_issue', $html);
+		(new TPFWLI_Admin_Page())->register();
+		$this->assertTrue((bool) has_action('admin_post_tpfwli_resume'));
+
+		self::$mail = array();
+		$resume = $this->postAdminResume($input);
+		$this->assertTrue(!empty($resume['ok']), implode('; ', $resume['errors'] ?? array()));
+		$fresh = wc_get_order($order->get_id());
+		$this->assertSame('completed', $fresh->get_status());
+		$this->assertSame($nanos, $resume['nanos']);
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+
+		self::$mail = array();
+		$again = (new TPFWLI_Orchestrator())->run($input, 'resume');
+		$this->assertTrue(!empty($again['ok']) || !empty($again['email_already']));
+		$this->assertSame($nanos, $again['nanos']);
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+	}
+
+	public function test_abort_after_completed_before_email_is_resumable(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-after-completed@example.com',
+			'first_name' => 'LifeAfterCompleted',
+			'quantity'   => '1',
+		));
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$abort = static function (string $point) {
+			if ($point === 'after_completed') {
+				throw new RuntimeException('lifecycle-checkpoint:after_completed');
+			}
+		};
+		add_action('tpfwli_lifecycle_checkpoint', $abort, 10, 1);
+		try {
+			(new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->fail('confirm should abort after completed');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('after_completed', $e->getMessage());
+		} finally {
+			remove_action('tpfwli_lifecycle_checkpoint', $abort, 10);
+		}
+		$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$order = $found['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('completed', $order->get_status());
+		$this->assertSame('issued', (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame('not_sent', (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$html = $this->adminResultHtml($order);
+		$this->assertStringContainsString('tpfwli_resume', $html);
+		self::$mail = array();
+		$resume = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
+		$this->assertTrue($resume['ok'], implode('; ', $resume['errors']));
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		$this->assertSame($start_stock - 1, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+	}
+
+	public function test_cancelled_result_page_explains_block_and_resume_post_is_refused(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'life-admin-block@example.com',
+			'first_name' => 'LifeAdminBlock',
+			'quantity'   => '1',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = $first['order'];
+		$order->update_status('cancelled', 'test admin block', true);
+		$html = $this->adminResultHtml(wc_get_order($order->get_id()));
+		$this->assertStringContainsString('cannot be resumed', $html);
+		$this->assertStringNotContainsString('name="action" value="tpfwli_resume"', $html);
+		$this->assertStringNotContainsString('name="action" value="tpfwli_retry_issue"', $html);
+		$this->assertStringNotContainsString('name="action" value="tpfwli_retry_email"', $html);
+		self::$mail = array();
+		$posted = $this->postAdminResume($input);
+		$this->assertFalse(!empty($posted['ok']));
+		$this->assertStringContainsString('cancelled', implode(' ', $posted['errors'] ?? array()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+
+		wp_set_current_user(self::$subscriber_id);
+		$_POST = $input;
+		$_POST['action'] = 'tpfwli_resume';
+		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_resume');
+		$this->installWpDieThrower();
+		try {
+			(new TPFWLI_Admin_Page())->handle_resume();
+			$this->fail('subscriber resume POST should be refused');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('wp_die:', $e->getMessage());
+		} finally {
+			wp_set_current_user(self::$admin_id);
+			unset($_POST, $_REQUEST['_wpnonce']);
+		}
+	}
+
 	public function test_plugin_deactivation_does_not_touch_orders_or_tickets(): void
 	{
 		$input = $this->valid_input(array(
@@ -2774,6 +3122,75 @@ final class LegacyImporterIntegrationTest extends TestCase
 	{
 		global $wpdb;
 		return (string) $wpdb->get_var('SELECT @@SESSION.in_transaction');
+	}
+
+	/**
+	 * @param array<string,mixed> $input
+	 */
+	private function assertLifecycleBlocked(array $input, WC_Order $order, int $stock, int $orders_before, string $needle): void
+	{
+		$order_id = (int) $order->get_id();
+		$tickets = $this->count_tickets_for_order($order_id);
+		$notes = (string) $order->get_status();
+		foreach (array('confirm', 'retry_issue', 'retry_email', 'resume') as $mode) {
+			self::$mail = array();
+			$result = (new TPFWLI_Orchestrator())->run($input, $mode);
+			$this->assertFalse($result['ok'], $needle . ' ' . $mode . ' ' . implode('; ', $result['errors'] ?? array()));
+			$this->assertStringContainsString($needle, implode(' ', $result['errors'] ?? array()), $mode);
+			$this->assertSame($order_id, $result['order'] instanceof WC_Order ? (int) $result['order']->get_id() : $order_id, $mode);
+			$this->assertSame($orders_before, $this->count_import_orders(), $mode);
+			$this->assertSame($stock, $this->db_product_stock(self::$ticket_id), $mode);
+			$this->assertSame($tickets, $this->count_tickets_for_order($order_id), $mode);
+			$this->assertSame(0, $this->customerMailCount((string) $input['email']), $mode);
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertInstanceOf(WC_Order::class, $found['order'], $mode);
+			$this->assertSame($order_id, (int) $found['order']->get_id(), $mode);
+			$this->assertSame($notes, $found['order']->get_status(), $mode);
+		}
+	}
+
+	private function adminResultHtml(WC_Order $order): string
+	{
+		if (!function_exists('submit_button')) {
+			require_once ABSPATH . 'wp-admin/includes/template.php';
+		}
+		delete_transient('tpfwli_result_' . get_current_user_id());
+		$_GET['view'] = 'result';
+		$_GET['order_id'] = (string) $order->get_id();
+		$page = new TPFWLI_Admin_Page();
+		ob_start();
+		(new ReflectionMethod($page, 'render_result'))->invoke($page);
+		$html = (string) ob_get_clean();
+		unset($_GET['view'], $_GET['order_id']);
+		return $html;
+	}
+
+	/**
+	 * @param array<string,mixed> $input
+	 * @return array<string,mixed>
+	 */
+	private function postAdminResume(array $input): array
+	{
+		$_POST = $input;
+		$_POST['action'] = 'tpfwli_resume';
+		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_resume');
+		$_SERVER['REQUEST_METHOD'] = 'POST';
+		$redirect = static function ($location) {
+			throw new RuntimeException('redirect:' . $location);
+		};
+		add_filter('wp_redirect', $redirect, 999);
+		try {
+			(new TPFWLI_Admin_Page())->handle_resume();
+			$this->fail('resume POST should redirect');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('redirect:', $e->getMessage());
+		} finally {
+			remove_filter('wp_redirect', $redirect, 999);
+			unset($_POST, $_REQUEST['_wpnonce']);
+		}
+		$flash = get_transient('tpfwli_result_' . get_current_user_id());
+		$this->assertIsArray($flash);
+		return $flash;
 	}
 
 	private function failTxnInspectWhen(callable $active): callable

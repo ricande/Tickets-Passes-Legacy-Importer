@@ -67,7 +67,7 @@ final class TPFWLI_Orchestrator
 
 	/**
 	 * @param array<string,mixed> $input
-	 * @param string              $mode confirm|retry_issue|retry_email
+	 * @param string              $mode confirm|retry_issue|retry_email|resume
 	 * @return array<string,mixed>
 	 */
 	public function run(array $input, string $mode = 'confirm'): array
@@ -113,31 +113,34 @@ final class TPFWLI_Orchestrator
 			$product_id = (int) $data['product_id'];
 			$quantity   = (int) $data['quantity'];
 			if ($existing instanceof WC_Order) {
+				$life = TPFWLI_Order_Lifecycle::assess($existing);
+				if (!$life['ok']) {
+					return $this->fail_result(array($life['error']), $existing, $import_id);
+				}
 				$locked_product_id = (int) $existing->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID);
 				$locked_quantity   = (int) $existing->get_meta(TPFWLI_Plugin::META_EXPECTED_QUANTITY);
 				if ($locked_product_id > 0 && $locked_quantity > 0) {
 					$product_id = $locked_product_id;
 					$quantity   = $locked_quantity;
 				}
-			}
-
-			if ($mode === 'retry_email' && $existing instanceof WC_Order) {
-				$quantity = (int) $existing->get_meta(TPFWLI_Plugin::META_EXPECTED_QUANTITY);
-				if ($quantity < 1) {
-					return $this->fail_result(
-						array(__('This importer order is missing its locked quantity snapshot.', 'tickets-passes-legacy-importer')),
-						$existing,
-						$import_id
-					);
+				$issued = (string) $existing->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE) === 'issued';
+				if ($issued || $mode === 'retry_email' || $mode === 'resume') {
+					if (!$issued) {
+						return $this->fail_result(
+							array(__('Tickets are not issued yet; this resume action is not available.', 'tickets-passes-legacy-importer')),
+							$existing,
+							$import_id
+						);
+					}
+					if ($quantity < 1) {
+						return $this->fail_result(
+							array(__('This importer order is missing its locked quantity snapshot.', 'tickets-passes-legacy-importer')),
+							$existing,
+							$import_id
+						);
+					}
+					return $this->resume_issued_import($existing, $quantity);
 				}
-				if ((string) $existing->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE) !== 'issued') {
-					return $this->fail_result(
-						array(__('Tickets are not issued yet; email retry is not available.', 'tickets-passes-legacy-importer')),
-						$existing,
-						$import_id
-					);
-				}
-				return $this->maybe_send_email($existing, $quantity);
 			}
 
 			$need_stock_headroom = true;
@@ -181,6 +184,11 @@ final class TPFWLI_Orchestrator
 				);
 			}
 			$order = $shaped['order'];
+			$fresh = $this->require_fresh_resumable($order, $import_id);
+			if (!$fresh['ok']) {
+				return $fresh;
+			}
+			$order = $fresh['order'];
 
 			$issue_stage = (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE);
 			if ($issue_stage !== 'issued') {
@@ -246,6 +254,8 @@ final class TPFWLI_Orchestrator
 			'email_stage'   => (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE),
 			'import_id'     => (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID),
 			'verify_ok'     => $verify_ok,
+			'wc_status'     => TPFWLI_Order_Lifecycle::status($order),
+			'lifecycle'     => TPFWLI_Order_Lifecycle::assess($order),
 		);
 	}
 
@@ -255,6 +265,11 @@ final class TPFWLI_Orchestrator
 	 */
 	private function ensure_stock(WC_Order $order, WC_Product $product, int $quantity): array
 	{
+		$fresh = $this->require_fresh_resumable($order, (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		if (!$fresh['ok']) {
+			return $fresh;
+		}
+		$order = $fresh['order'];
 		$result = $this->stock->reduce_if_needed($order, $product, $quantity);
 		if (!empty($result['connection_unsafe'])) {
 			TPFWLI_Database_Session::quarantine(
@@ -306,6 +321,11 @@ final class TPFWLI_Orchestrator
 	 */
 	private function ensure_issue_then_email(WC_Order $order, int $quantity, array $product_meta, bool $send_email): array
 	{
+		$fresh = $this->require_fresh_resumable($order, (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		if (!$fresh['ok']) {
+			return $fresh;
+		}
+		$order = $fresh['order'];
 		$email_stage = (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE);
 		$issue_stage = (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE);
 
@@ -362,6 +382,7 @@ final class TPFWLI_Orchestrator
 				)
 			);
 			$order = wc_get_order($order->get_id());
+			do_action('tpfwli_lifecycle_checkpoint', 'after_issued', $order);
 		} else {
 			$verified = $this->adapter->verify_issue($order, $quantity);
 			if (!$verified['ok']) {
@@ -369,7 +390,12 @@ final class TPFWLI_Orchestrator
 			}
 		}
 
-		$this->mark_completed($order);
+		$completed = $this->complete_issued_order($order);
+		if (!$completed['ok']) {
+			return $completed;
+		}
+		$order = $completed['order'];
+		do_action('tpfwli_lifecycle_checkpoint', 'after_completed', $order);
 
 		if (!$send_email && $email_stage === 'sent') {
 			$order = wc_get_order($order->get_id());
@@ -380,12 +406,55 @@ final class TPFWLI_Orchestrator
 	}
 
 	/**
+	 * Finish an already-issued import without a new stock draw or force_issue.
+	 *
+	 * @return array<string,mixed>
+	 */
+	private function resume_issued_import(WC_Order $order, int $quantity): array
+	{
+		$import_id = (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID);
+		$fresh = $this->require_fresh_resumable($order, $import_id);
+		if (!$fresh['ok']) {
+			return $fresh;
+		}
+		$order = $fresh['order'];
+
+		$expected_pid = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID);
+		$product      = wc_get_product($expected_pid);
+		if (!$product instanceof WC_Product || !$this->stock->is_accounted($order, $product, $quantity)) {
+			return $this->fail_result(
+				array(__('Existing stock reduction for this import could not be verified. The import was not completed.', 'tickets-passes-legacy-importer')),
+				$order,
+				$import_id
+			);
+		}
+
+		$verified = $this->adapter->verify_issue($order, $quantity);
+		if (!$verified['ok']) {
+			return $this->result(false, $verified['errors'], $order, $verified['nanos']);
+		}
+
+		$completed = $this->complete_issued_order($order);
+		if (!$completed['ok']) {
+			return $completed;
+		}
+		$order = $completed['order'];
+		do_action('tpfwli_lifecycle_checkpoint', 'after_completed', $order);
+
+		return $this->maybe_send_email($order, $quantity, $verified['nanos']);
+	}
+
+	/**
 	 * @param string[] $nanos
 	 * @return array<string,mixed>
 	 */
 	private function maybe_send_email(WC_Order $order, int $quantity, array $nanos = array()): array
 	{
-		$order = wc_get_order($order->get_id());
+		$fresh = $this->require_fresh_resumable($order, (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		if (!$fresh['ok']) {
+			return $fresh;
+		}
+		$order = $fresh['order'];
 		if ((string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE) !== 'issued') {
 			$verified = $this->adapter->verify_issue($order, $quantity);
 			if (!$verified['ok']) {
@@ -469,8 +538,17 @@ final class TPFWLI_Orchestrator
 		return $this->result(true, array(), wc_get_order($order->get_id()), $nanos);
 	}
 
-	private function mark_completed(WC_Order $order): void
+	/**
+	 * @return array<string,mixed>
+	 */
+	private function complete_issued_order(WC_Order $order): array
 	{
+		$import_id = (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID);
+		$fresh = $this->require_fresh_resumable($order, $import_id);
+		if (!$fresh['ok']) {
+			return $fresh;
+		}
+		$order = $fresh['order'];
 		if (!$order->get_date_paid('edit')) {
 			$order->set_date_paid(time());
 		}
@@ -479,6 +557,43 @@ final class TPFWLI_Orchestrator
 		} else {
 			$order->save();
 		}
+		$order = wc_get_order($order->get_id());
+		if (!$order instanceof WC_Order || $order->get_status() !== 'completed') {
+			return $this->fail_result(
+				array(__('The order was not marked completed. The customer email was not sent.', 'tickets-passes-legacy-importer')),
+				$order,
+				$import_id
+			);
+		}
+		$life = TPFWLI_Order_Lifecycle::assess($order);
+		if (!$life['ok']) {
+			return $this->fail_result(array($life['error']), $order, $import_id);
+		}
+		return $this->result(true, array(), $order);
+	}
+
+	/**
+	 * @return array<string,mixed>
+	 */
+	private function require_fresh_resumable(WC_Order $order, string $import_id): array
+	{
+		$fresh = wc_get_order($order->get_id());
+		if (!$fresh instanceof WC_Order) {
+			return $this->fail_result(
+				array(__('The importer order no longer exists.', 'tickets-passes-legacy-importer')),
+				null,
+				$import_id
+			);
+		}
+		$life = TPFWLI_Order_Lifecycle::assess($fresh);
+		if (!$life['ok']) {
+			return $this->fail_result(array($life['error']), $fresh, $import_id);
+		}
+		return array(
+			'ok'    => true,
+			'order' => $fresh,
+			'error' => '',
+		);
 	}
 
 	/**

@@ -26,6 +26,7 @@ final class TPFWLI_Admin_Page
 		add_action('admin_post_tpfwli_confirm', array($this, 'handle_confirm'));
 		add_action('admin_post_tpfwli_retry_issue', array($this, 'handle_retry_issue'));
 		add_action('admin_post_tpfwli_retry_email', array($this, 'handle_retry_email'));
+		add_action('admin_post_tpfwli_resume', array($this, 'handle_resume'));
 		add_action('admin_notices', array($this, 'dependency_notice'));
 	}
 
@@ -119,6 +120,13 @@ final class TPFWLI_Admin_Page
 		$this->require_post('tpfwli_retry_email');
 		$this->require_mutation_ready();
 		$this->store_run($this->orchestrator->run($this->posted_input(), 'retry_email'));
+	}
+
+	public function handle_resume(): void
+	{
+		$this->require_post('tpfwli_resume');
+		$this->require_mutation_ready();
+		$this->store_run($this->orchestrator->run($this->posted_input(), 'resume'));
 	}
 
 	private function store_run(array $result): void
@@ -322,8 +330,16 @@ final class TPFWLI_Admin_Page
 			'import_id'  => $state['import_id'],
 		);
 
+		$life = TPFWLI_Order_Lifecycle::assess($order);
+		if (!$life['ok']) {
+			echo '<div class="notice notice-error"><p>' . esc_html($life['error']) . '</p></div>';
+			return;
+		}
+
 		if ($issue_stage !== 'issued') {
 			$this->retry_form('tpfwli_retry_issue', __('Retry ticket issue', 'tickets-passes-legacy-importer'), $input);
+		} elseif ($email_stage === 'not_sent') {
+			$this->retry_form('tpfwli_resume', __('Finish issued import', 'tickets-passes-legacy-importer'), $input);
 		} elseif ($email_stage === 'failed') {
 			$this->retry_form('tpfwli_retry_email', __('Retry email', 'tickets-passes-legacy-importer'), $input);
 		} elseif ($email_stage === 'sending' || $email_stage === 'unknown') {
