@@ -450,7 +450,8 @@ final class TPFWLI_Orchestrator
 	 */
 	private function maybe_send_email(WC_Order $order, int $quantity, array $nanos = array()): array
 	{
-		$fresh = $this->require_fresh_resumable($order, (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		$import_id = (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID);
+		$fresh = $this->require_fresh_resumable($order, $import_id);
 		if (!$fresh['ok']) {
 			return $fresh;
 		}
@@ -498,6 +499,15 @@ final class TPFWLI_Orchestrator
 				null,
 				false,
 				true
+			);
+		}
+
+		$order = wc_get_order($order->get_id());
+		if (!$order instanceof WC_Order || $order->get_status() !== 'completed') {
+			return $this->fail_result(
+				array(__('The order is not completed. The customer email was not sent.', 'tickets-passes-legacy-importer')),
+				$order,
+				$import_id
 			);
 		}
 

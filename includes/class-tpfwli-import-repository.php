@@ -133,66 +133,10 @@ final class TPFWLI_Import_Repository
 	 */
 	private function query_identity_orders_including_hidden(array $args, string $read_error): array
 	{
-		$args['status'] = 'any';
-		$found = $this->query_identity_orders($args, $read_error);
-		if (!$found['ok'] || $found['orders'] !== array()) {
-			return $found;
-		}
-		$args['status'] = 'trash';
-		$found = $this->query_identity_orders($args, $read_error);
-		if (!$found['ok'] || $found['orders'] !== array()) {
-			return $found;
-		}
-		if (!isset($args['meta_key'], $args['meta_value'])) {
-			return $found;
-		}
-		return $this->query_identity_orders_by_id($args, $read_error);
-	}
-
-	/**
-	 * @param array<string,mixed> $args
-	 * @return array{ok:bool,orders:WC_Order[],error:string}
-	 */
-	private function query_identity_orders_by_id(array $args, string $read_error): array
-	{
-		global $wpdb;
-		if (!$wpdb instanceof wpdb) {
-			return array('ok' => false, 'orders' => array(), 'error' => $read_error);
-		}
-		$previous_suppress = $wpdb->suppress_errors(true);
-		$previous_show     = $wpdb->show_errors(false);
-		try {
-			if (isset($args['meta_key'], $args['meta_value'])) {
-				$sql = $wpdb->prepare(
-					"SELECT order_id FROM {$wpdb->prefix}wc_orders_meta WHERE meta_key = %s AND meta_value = %s LIMIT 2",
-					(string) $args['meta_key'],
-					(string) $args['meta_value']
-				);
-			} elseif (isset($args['created_via'])) {
-				$sql = $wpdb->prepare(
-					"SELECT id FROM {$wpdb->prefix}wc_orders WHERE created_via = %s LIMIT 2",
-					(string) $args['created_via']
-				);
-			} else {
-				return array('ok' => true, 'orders' => array(), 'error' => '');
-			}
-			$ids = $wpdb->get_col($sql);
-			if ((string) $wpdb->last_error !== '') {
-				return array('ok' => false, 'orders' => array(), 'error' => $read_error);
-			}
-		} finally {
-			$wpdb->suppress_errors((bool) $previous_suppress);
-			$wpdb->show_errors((bool) $previous_show);
-		}
-
-		$orders = array();
-		foreach ((array) $ids as $id) {
-			$order = wc_get_order((int) $id);
-			if ($order instanceof WC_Order) {
-				$orders[] = $order;
-			}
-		}
-		return array('ok' => true, 'orders' => $orders, 'error' => '');
+		$args['status'] = 'all';
+		$args['return'] = 'ids';
+		$args['limit']  = max(2, (int) ($args['limit'] ?? 2));
+		return $this->query_identity_orders($args, $read_error);
 	}
 
 	/**
@@ -276,6 +220,14 @@ final class TPFWLI_Import_Repository
 
 		$out = array();
 		foreach ($orders as $order) {
+			if (is_numeric($order)) {
+				$loaded = wc_get_order((int) $order);
+				if (!$loaded instanceof WC_Order) {
+					return array('ok' => false, 'orders' => array(), 'error' => $read_error);
+				}
+				$out[] = $loaded;
+				continue;
+			}
 			if (!$order instanceof WC_Order) {
 				return array('ok' => false, 'orders' => array(), 'error' => $read_error);
 			}
