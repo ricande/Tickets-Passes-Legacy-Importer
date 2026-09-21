@@ -1022,6 +1022,127 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 	}
 
+	public function test_meta_lookup_sql_error_still_stops_after_woocommerce_order_query_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-meta-mask@example.com',
+			'first_name' => 'LookupMetaMask',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenSuccessfulSelect($input['import_id'], 'meta', 1, function () use ($input, $before): void {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertNull($found['order']);
+			$this->assertStringContainsString('import ID', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
+	public function test_created_via_lookup_sql_error_still_stops_after_woocommerce_order_query_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-via-mask@example.com',
+			'first_name' => 'LookupViaMask',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenSuccessfulSelect($input['import_id'], 'created_via', 1, function () use ($input, $before): void {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertStringContainsString('created_via', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
+	public function test_later_create_or_resume_lookup_sql_error_still_stops_after_order_query_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-later-mask@example.com',
+			'first_name' => 'LookupLaterMask',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenSuccessfulSelect($input['import_id'], 'any', 3, function () use ($input, $before): void {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
+	public function test_stale_wpdb_last_error_does_not_fail_a_successful_miss(): void
+	{
+		global $wpdb;
+		$previous = (string) $wpdb->last_error;
+		$wpdb->last_error = 'unrelated leftover from another query';
+		try {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id(wp_generate_uuid4());
+			$this->assertTrue($found['ok']);
+			$this->assertNull($found['order']);
+			$this->assertSame('', $found['error']);
+		} finally {
+			$wpdb->last_error = $previous;
+		}
+	}
+
+	public function test_bootstrap_tables_include_posts_and_notes_when_hpos_sync_is_off(): void
+	{
+		global $wpdb;
+		$this->withHposSyncOption('no', function () use ($wpdb): void {
+			$tables = TPFWLI_Dependencies::bootstrap_storage_tables();
+			$this->assertContains($wpdb->posts, $tables);
+			$this->assertContains($wpdb->postmeta, $tables);
+			$this->assertContains($wpdb->comments, $tables);
+			$this->assertContains($wpdb->commentmeta, $tables);
+		});
+	}
+
+	public function test_bootstrap_tables_include_posts_and_notes_when_hpos_sync_is_on(): void
+	{
+		global $wpdb;
+		$this->withHposSyncOption('yes', function () use ($wpdb): void {
+			$tables = TPFWLI_Dependencies::bootstrap_storage_tables();
+			$this->assertContains($wpdb->posts, $tables);
+			$this->assertContains($wpdb->postmeta, $tables);
+			$this->assertContains($wpdb->comments, $tables);
+			$this->assertContains($wpdb->commentmeta, $tables);
+		});
+	}
+
+	public function test_observed_non_transactional_engine_stops_bootstrap_without_mutations(): void
+	{
+		global $wpdb;
+		$input = $this->valid_input(array(
+			'email'      => 'engine-probe@example.com',
+			'first_name' => 'EngineProbe',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$probe  = $this->createNonTransactionalProbeTable();
+		$filter = static function (array $tables) use ($probe) {
+			$tables[] = $probe;
+			return $tables;
+		};
+		add_filter('tpfwli_bootstrap_storage_tables', $filter);
+		try {
+			$problems = TPFWLI_Dependencies::transactional_storage_problems();
+			$this->assertNotSame(array(), $problems);
+			$this->assertTrue((bool) preg_grep('/' . preg_quote($probe, '/') . '/', $problems));
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+		} finally {
+			remove_filter('tpfwli_bootstrap_storage_tables', $filter);
+			$wpdb->query('DROP TABLE IF EXISTS `' . str_replace('`', '', $probe) . '`');
+		}
+	}
+
 	public function test_two_matching_orders_still_stop_import(): void
 	{
 		$input = $this->valid_input(array(
@@ -1167,6 +1288,64 @@ final class LegacyImporterIntegrationTest extends TestCase
 	}
 
 	/**
+	 * @param callable():void $callback
+	 */
+	private function withIdentityLookupFailureThenSuccessfulSelect(string $import_id, string $which, int $from_call, callable $callback): void
+	{
+		$fail = $this->failIdentityQueries($import_id, $which, $from_call);
+		$mask = static function ($results) {
+			global $wpdb;
+			$wpdb->get_var('SELECT 1');
+			return $results;
+		};
+		add_filter('woocommerce_order_query', $mask, 10, 2);
+		try {
+			$callback();
+		} finally {
+			remove_filter('query', $fail, 999);
+			remove_filter('woocommerce_order_query', $mask, 10);
+		}
+	}
+
+	/**
+	 * @param callable(string[]):void $callback
+	 */
+	private function withHposSyncOption(string $value, callable $callback): void
+	{
+		$filter = static function () use ($value) {
+			return $value;
+		};
+		add_filter('pre_option_woocommerce_custom_orders_table_data_sync_enabled', $filter);
+		try {
+			$callback();
+		} finally {
+			remove_filter('pre_option_woocommerce_custom_orders_table_data_sync_enabled', $filter);
+		}
+	}
+
+	/**
+	 * @return string Disposable table name.
+	 */
+	private function createNonTransactionalProbeTable(): string
+	{
+		global $wpdb;
+		$name = $wpdb->prefix . 'tpfwli_probe_' . substr(md5(uniqid((string) mt_rand(), true)), 0, 12);
+		$quoted = '`' . str_replace('`', '', $name) . '`';
+		$created = $wpdb->query("CREATE TABLE {$quoted} (`id` INT UNSIGNED NOT NULL) ENGINE=MyISAM");
+		if ($created === false) {
+			$created = $wpdb->query("CREATE TABLE {$quoted} (`id` INT UNSIGNED NOT NULL) ENGINE=MEMORY");
+		}
+		$this->assertNotFalse($created, 'Could not create a disposable non-transactional probe table');
+		$engine = (string) $wpdb->get_var($wpdb->prepare(
+			'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
+			$name
+		));
+		$this->assertNotSame('', $engine);
+		$this->assertFalse(TPFWLI_Dependencies::engine_is_transactional($engine), $name . ' engine ' . $engine);
+		return $name;
+	}
+
+	/**
 	 * @param array<string,mixed> $override
 	 * @return array<string,mixed>
 	 */
@@ -1253,6 +1432,12 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame(0, $this->db_table_count($this->order_items_table(), 'order_id', $seen_id));
 		global $wpdb;
 		$this->assertSame(0, (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->posts} WHERE ID = %d", $seen_id)));
+		$this->assertSame(0, (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id = %d", $seen_id)));
+		$this->assertSame(0, (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->comments} WHERE comment_post_ID = %d", $seen_id)));
+		$this->assertSame(0, (int) $wpdb->get_var($wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->commentmeta} cm INNER JOIN {$wpdb->comments} c ON c.comment_ID = cm.comment_id WHERE c.comment_post_ID = %d",
+			$seen_id
+		)));
 		$this->assertSame($start_stock, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
 		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
 		$this->assertSame(0, $this->count_tickets_for_order($seen_id));
@@ -1283,21 +1468,12 @@ final class LegacyImporterIntegrationTest extends TestCase
 	private function assertHposTablesAreInnoDb(): void
 	{
 		global $wpdb;
-		$tables = array(
-			$this->hpos_orders_table(),
-			$this->hpos_operational_table(),
-			$this->hpos_address_table(),
-			$this->hpos_meta_table(),
-			$this->order_items_table(),
-			$wpdb->posts,
-		);
-		foreach ($tables as $table) {
-			$engine = $wpdb->get_var($wpdb->prepare(
-				'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
-				$table
-			));
-			$this->assertSame('InnoDB', $engine, $table . ' must be InnoDB for bootstrap transactions');
-		}
+		$tables = TPFWLI_Dependencies::bootstrap_storage_tables();
+		$this->assertContains($wpdb->posts, $tables);
+		$this->assertContains($wpdb->postmeta, $tables);
+		$this->assertContains($wpdb->comments, $tables);
+		$this->assertContains($wpdb->commentmeta, $tables);
+		$this->assertSame(array(), TPFWLI_Dependencies::transactional_storage_problems());
 	}
 
 	/**

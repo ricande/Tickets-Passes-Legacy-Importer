@@ -114,13 +114,17 @@ final class TPFWLI_Dependencies
 		$tables[] = $wpdb->prefix . 'woocommerce_order_items';
 		$tables[] = $wpdb->prefix . 'woocommerce_order_itemmeta';
 
-		if (get_option('woocommerce_custom_orders_table_data_sync_enabled') === 'yes') {
-			$tables[] = $wpdb->posts;
-			$tables[] = $wpdb->postmeta;
-		}
+		// wc_create_order -> persist_order_to_db -> maybe_create_backup_post -> wp_insert_post
+		// even when HPOS data sync is off (placeholder shop_order_placehold).
+		$tables[] = $wpdb->posts;
+		$tables[] = $wpdb->postmeta;
+
+		// Order_Shape repair adds an order note via WC_Order::add_order_note -> wp_insert_comment.
+		$tables[] = $wpdb->comments;
+		$tables[] = $wpdb->commentmeta;
 
 		$tables = array_values(array_unique(array_filter($tables)));
-		return $tables;
+		return apply_filters('tpfwli_bootstrap_storage_tables', $tables);
 	}
 
 	public static function engine_is_transactional(string $engine): bool

@@ -10,8 +10,10 @@ defined('ABSPATH') || exit;
  * the assumption that created_via lands in the first HPOS INSERT.
  *
  * WooCommerce 11.1 OrdersTableQuery::run_query() uses $wpdb->get_col() and treats
- * a SQL failure as an empty ID list. This repository therefore captures the
- * identity query's own error before any follow-up lookup can overwrite it.
+ * a SQL failure as an empty ID list. wc_get_orders then runs woocommerce_order_query
+ * (and order hydration) before returning, which can overwrite $wpdb->last_error.
+ * Identity errors are therefore captured at the identity SQL itself, before any
+ * follow-up query runs.
  */
 final class TPFWLI_Import_Repository
 {
@@ -137,29 +139,55 @@ final class TPFWLI_Import_Repository
 
 		$previous_suppress = null;
 		$previous_show     = null;
+		$awaiting          = false;
+		$identity_error    = '';
+		$exception_error   = '';
+		$watcher           = null;
+		$orders            = null;
+
 		if ($wpdb instanceof wpdb) {
 			$previous_suppress = $wpdb->suppress_errors(true);
 			$previous_show     = $wpdb->show_errors(false);
+			$watcher = static function ($sql) use ($args, &$awaiting, &$identity_error) {
+				global $wpdb;
+				if ($awaiting) {
+					$identity_error = ($wpdb instanceof wpdb) ? (string) $wpdb->last_error : '';
+					$awaiting = false;
+				}
+				if (is_string($sql) && self::sql_looks_like_identity_query($sql, $args)) {
+					$awaiting = true;
+				}
+				return $sql;
+			};
+			add_filter('query', $watcher, 1);
 		}
 
-		$sql_error = '';
-		$orders    = null;
 		try {
 			$orders = wc_get_orders($args);
-			if ($wpdb instanceof wpdb) {
-				$sql_error = (string) $wpdb->last_error;
+			if ($awaiting && $wpdb instanceof wpdb) {
+				$identity_error = (string) $wpdb->last_error;
+				$awaiting = false;
 			}
 		} catch (Throwable $e) {
-			$sql_error = $e->getMessage();
-			$orders    = null;
+			if ($awaiting && $wpdb instanceof wpdb) {
+				$identity_error = (string) $wpdb->last_error;
+				$awaiting = false;
+			}
+			if ($identity_error === '') {
+				$exception_error = $e->getMessage();
+			}
+			$orders = null;
 		} finally {
+			if (is_callable($watcher)) {
+				remove_filter('query', $watcher, 1);
+			}
 			if ($wpdb instanceof wpdb) {
 				$wpdb->suppress_errors((bool) $previous_suppress);
 				$wpdb->show_errors((bool) $previous_show);
 			}
 		}
 
-		if ($sql_error !== '') {
+		if ($identity_error !== '' || $exception_error !== '') {
 			return array('ok' => false, 'orders' => array(), 'error' => $read_error);
 		}
 
@@ -180,5 +208,22 @@ final class TPFWLI_Import_Repository
 		}
 
 		return array('ok' => true, 'orders' => $out, 'error' => '');
+	}
+
+	/**
+	 * @param array<string,mixed> $args
+	 */
+	private static function sql_looks_like_identity_query(string $sql, array $args): bool
+	{
+		if (isset($args['meta_key'], $args['meta_value'])) {
+			$key   = (string) $args['meta_key'];
+			$value = (string) $args['meta_value'];
+			return $key !== '' && $value !== '' && str_contains($sql, $key) && str_contains($sql, $value);
+		}
+		if (isset($args['created_via'])) {
+			$via = (string) $args['created_via'];
+			return $via !== '' && str_contains($sql, $via);
+		}
+		return false;
 	}
 }
