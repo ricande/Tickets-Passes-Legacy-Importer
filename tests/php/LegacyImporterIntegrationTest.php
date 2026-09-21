@@ -943,7 +943,10 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$mysql->query('SELECT 1');
 			$mysql->query('COMMIT');
 			$inspect = $this->callStockPrivate($service, 'inspect_sql_transaction');
-			$this->assertSame('closed', $inspect['status'], wp_json_encode($inspect));
+			$this->assertSame('unknown', $inspect['status'], wp_json_encode($inspect));
+			$idle_gate = $this->callStockPrivate($service, 'begin_stock_transaction_if_idle');
+			$this->assertFalse($idle_gate['ok'], wp_json_encode($idle_gate));
+			$this->assertFalse($idle_gate['accepted']);
 
 			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
 			$this->assertTrue($started['ok'], $started['error'] ?? '');
@@ -956,14 +959,14 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$committed = $this->callStockPrivate($service, 'commit_sql_transaction');
 			$this->assertTrue($committed['ok'], $committed['error'] ?? '');
 			$after_commit = $this->callStockPrivate($service, 'inspect_sql_transaction');
-			$this->assertSame('closed', $after_commit['status'], wp_json_encode($after_commit));
+			$this->assertNotSame('open', $after_commit['status'], wp_json_encode($after_commit));
 
 			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
 			$this->assertTrue($started['ok'], $started['error'] ?? '');
 			$rolled = $this->callStockPrivate($service, 'rollback_sql_transaction');
 			$this->assertTrue($rolled['ok'], $rolled['error'] ?? '');
 			$after_rollback = $this->callStockPrivate($service, 'inspect_sql_transaction');
-			$this->assertSame('closed', $after_rollback['status'], wp_json_encode($after_rollback));
+			$this->assertNotSame('open', $after_rollback['status'], wp_json_encode($after_rollback));
 		} finally {
 			$mysql->query('ROLLBACK');
 			$mysql->suppress_errors(false);
@@ -1027,6 +1030,30 @@ final class LegacyImporterIntegrationTest extends TestCase
 					$this->assertMysqlIncompletePsLeavesOuterTransaction($admin, $mode, $scenario, $id);
 					$id++;
 				}
+			}
+		} finally {
+			$this->mysqlPsRestore($admin, $saved);
+		}
+	}
+
+	public function test_mysql_reenabled_ps_stale_committed_is_not_closed(): void
+	{
+		$admin = $this->isolatedMysql();
+		if (!$admin instanceof wpdb) {
+			$this->markTestSkipped('Isolated MySQL is not available on 127.0.0.1:3307');
+		}
+		$saved = $this->mysqlPsSnapshot($admin);
+		$admin->query('CREATE TABLE IF NOT EXISTS tpfwli_ps_probe (id INT PRIMARY KEY, note VARCHAR(64)) ENGINE=InnoDB');
+		$modes = array(
+			'instrument_off',
+			'thread_not_instrumented',
+			'thread_instrumentation_off',
+		);
+		$id = 200;
+		try {
+			foreach ($modes as $mode) {
+				$this->assertMysqlReenabledPsDoesNotTreatStaleCommittedAsClosed($admin, $mode, $id);
+				$id++;
 			}
 		} finally {
 			$this->mysqlPsRestore($admin, $saved);
@@ -2735,6 +2762,82 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$admin->query("UPDATE performance_schema.setup_consumers SET ENABLED = 'NO' WHERE NAME = 'thread_instrumentation'");
 	}
 
+	private function mysqlPsReenableViaAdmin(wpdb $admin, int $connection_id): void
+	{
+		$this->mysqlPsEnableFull($admin);
+		$admin->query($admin->prepare(
+			"UPDATE performance_schema.threads SET INSTRUMENTED = 'YES' WHERE PROCESSLIST_ID = %d",
+			$connection_id
+		));
+	}
+
+	/**
+	 * @return array{instrument:string,global:string,thread:string,current:string,thread_inst:string,state:string}
+	 */
+	private function mysqlPsLiveFlags(wpdb $admin, int $connection_id): array
+	{
+		return array(
+			'instrument'  => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_instruments WHERE NAME = 'transaction'"),
+			'global'      => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'global_instrumentation'"),
+			'thread'      => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'thread_instrumentation'"),
+			'current'     => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_transactions_current'"),
+			'thread_inst' => (string) $admin->get_var($admin->prepare(
+				'SELECT INSTRUMENTED FROM performance_schema.threads WHERE PROCESSLIST_ID = %d',
+				$connection_id
+			)),
+			'state'       => strtoupper((string) $admin->get_var($admin->prepare(
+				'SELECT e.STATE
+				FROM performance_schema.threads t
+				LEFT JOIN performance_schema.events_transactions_current e ON e.THREAD_ID = t.THREAD_ID
+				WHERE t.PROCESSLIST_ID = %d',
+				$connection_id
+			))),
+		);
+	}
+
+	/**
+	 * @return array{0:callable,1:object}
+	 */
+	private function spySqlTxnCommands(): array
+	{
+		$seen = (object) array(
+			'START TRANSACTION' => 0,
+			'COMMIT'            => 0,
+			'ROLLBACK'          => 0,
+		);
+		$filter = static function ($sql) use ($seen) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			$normalized = strtoupper(trim($sql));
+			if (property_exists($seen, $normalized)) {
+				$seen->{$normalized}++;
+			}
+			return $sql;
+		};
+		add_filter('query', $filter, 999);
+		return array($filter, $seen);
+	}
+
+	private function assertMysqlStartGateLeavesOuterTransaction(string $label, wpdb $conn, wpdb $other, int $probe_id): void
+	{
+		[$filter, $seen] = $this->spySqlTxnCommands();
+		try {
+			$gate = $this->callStockPrivate(new TPFWLI_Stock_Service(), 'begin_stock_transaction_if_idle');
+		} finally {
+			remove_filter('query', $filter, 999);
+		}
+		$this->assertFalse($gate['ok'], $label . ' ' . wp_json_encode($gate));
+		$this->assertFalse($gate['accepted'], $label);
+		$this->assertSame(0, $seen->{'START TRANSACTION'}, $label);
+		$this->assertSame(0, $seen->COMMIT, $label);
+		$this->assertSame(0, $seen->ROLLBACK, $label);
+		$this->assertTrue($conn->ready, $label);
+		$this->assertNotEmpty($conn->dbh, $label);
+		$this->assertSame(1, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)), $label);
+		$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)), $label);
+	}
+
 	private function assertMysqlIncompletePsLeavesOuterTransaction(wpdb $admin, string $mode, string $scenario, int $probe_id): void
 	{
 		$this->mysqlPsEnableFull($admin);
@@ -2777,9 +2880,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 				$this->assertTrue($inspect['open']);
 			}
 
-			// Stock step must refuse without START/COMMIT/ROLLBACK when state is unknown.
-			$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
-			$this->assertSame(1, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+			$this->assertMysqlStartGateLeavesOuterTransaction($mode . ' ' . $scenario, $conn, $other, $probe_id);
 		} finally {
 			$conn->query('ROLLBACK');
 			$conn->query("UPDATE performance_schema.threads SET INSTRUMENTED = 'YES' WHERE PROCESSLIST_ID = CONNECTION_ID()");
@@ -2788,6 +2889,57 @@ final class LegacyImporterIntegrationTest extends TestCase
 			TPFWLI_Database_Session::reset_for_tests();
 		}
 		$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+		$this->assertSame(0, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+	}
+
+	private function assertMysqlReenabledPsDoesNotTreatStaleCommittedAsClosed(wpdb $admin, string $mode, int $probe_id): void
+	{
+		$this->mysqlPsEnableFull($admin);
+		$conn = $this->isolatedMysql();
+		$other = $this->isolatedMysql();
+		$this->assertInstanceOf(wpdb::class, $conn);
+		$this->assertInstanceOf(wpdb::class, $other);
+		$connection_id = (int) $conn->get_var('SELECT CONNECTION_ID()');
+		$this->assertGreaterThan(0, $connection_id, $mode);
+		$admin->query($admin->prepare('DELETE FROM tpfwli_ps_probe WHERE id = %d', $probe_id));
+		$conn->suppress_errors(true);
+		$previous = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = $conn;
+		try {
+			$conn->query('START TRANSACTION');
+			$conn->query('SELECT 1');
+			$conn->query('COMMIT');
+			$this->mysqlPsDisable($mode, $admin, $conn);
+			$conn->query('START TRANSACTION');
+			$conn->query($conn->prepare(
+				'INSERT INTO tpfwli_ps_probe (id, note) VALUES (%d, %s)',
+				$probe_id,
+				'reenable:' . $mode
+			));
+			$this->mysqlPsReenableViaAdmin($admin, $connection_id);
+			$flags = $this->mysqlPsLiveFlags($admin, $connection_id);
+			$this->assertSame('YES', $flags['instrument'], $mode . ' ' . wp_json_encode($flags));
+			$this->assertSame('YES', $flags['global'], $mode . ' ' . wp_json_encode($flags));
+			$this->assertSame('YES', $flags['thread'], $mode . ' ' . wp_json_encode($flags));
+			$this->assertSame('YES', $flags['current'], $mode . ' ' . wp_json_encode($flags));
+			$this->assertSame('YES', $flags['thread_inst'], $mode . ' ' . wp_json_encode($flags));
+			$this->assertSame('COMMITTED', $flags['state'], $mode . ' ' . wp_json_encode($flags));
+
+			$inspect = $this->callStockPrivate(new TPFWLI_Stock_Service(), 'inspect_sql_transaction');
+			$this->assertSame('unknown', $inspect['status'], $mode . ' ' . wp_json_encode(array('flags' => $flags, 'inspect' => $inspect)));
+			$this->assertFalse($inspect['ok']);
+			$this->assertFalse($inspect['open']);
+
+			$this->assertMysqlStartGateLeavesOuterTransaction('reenable ' . $mode, $conn, $other, $probe_id);
+		} finally {
+			$conn->query('ROLLBACK');
+			$conn->query("UPDATE performance_schema.threads SET INSTRUMENTED = 'YES' WHERE PROCESSLIST_ID = CONNECTION_ID()");
+			$GLOBALS['wpdb'] = $previous;
+			$this->mysqlPsEnableFull($admin);
+			TPFWLI_Database_Session::reset_for_tests();
+		}
+		$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)), $mode);
+		$this->assertSame(0, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)), $mode);
 	}
 
 	/**

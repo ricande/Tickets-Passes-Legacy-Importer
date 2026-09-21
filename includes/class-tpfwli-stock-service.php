@@ -9,7 +9,9 @@ defined('ABSPATH') || exit;
  * customer email stay outside this transaction and require a verified COMMIT.
  *
  * Transaction state is open, closed, or unknown. Empty INNODB_TRX is never
- * treated as closed. Responsibility is taken as soon as START is accepted.
+ * treated as closed. A historical COMMITTED or ROLLED BACK Performance Schema
+ * event is not proof that the session is idle. Responsibility is taken as
+ * soon as START is accepted.
  * An unconfirmed rollback isolates the database session so later business
  * writes cannot continue.
  *
@@ -19,6 +21,8 @@ defined('ABSPATH') || exit;
  */
 final class TPFWLI_Stock_Service
 {
+	private bool $owned_txn_observed_active = false;
+
 	public function is_reduced(WC_Order $order): bool
 	{
 		$order = wc_get_order($order->get_id());
@@ -93,18 +97,6 @@ final class TPFWLI_Stock_Service
 			return $fail(implode(' ', $storage));
 		}
 
-		$txn_state = $this->inspect_sql_transaction();
-		if (!$txn_state['ok']) {
-			return $fail(
-				$txn_state['error'] !== ''
-					? $txn_state['error']
-					: __('Could not determine whether a database transaction is already open. Stock was not changed.', 'tickets-passes-legacy-importer')
-			);
-		}
-		if ($txn_state['open']) {
-			return $fail(__('Stock reduction refused because another database transaction is already open.', 'tickets-passes-legacy-importer'));
-		}
-
 		$fresh = wc_get_product($product_id);
 		if (!$fresh || !$fresh->managing_stock()) {
 			return $fail(__('Stock is no longer managed on this product.', 'tickets-passes-legacy-importer'), null);
@@ -117,7 +109,7 @@ final class TPFWLI_Stock_Service
 		$on_line      = null;
 		$fatal        = null;
 		try {
-			$begin = $this->begin_sql_transaction();
+			$begin = $this->begin_stock_transaction_if_idle();
 			$txn_owned = !empty($begin['accepted']);
 			if (!$begin['ok']) {
 				if (!empty($begin['connection_unsafe'])) {
@@ -374,6 +366,7 @@ final class TPFWLI_Stock_Service
 
 	/**
 	 * Performance Schema is evidence only when this session's transactions are collected.
+	 * ACTIVE is open. A completed event is not treated as closed.
 	 *
 	 * @return array{ok:bool,open:bool,status:'open'|'closed'|'unknown',error:string}
 	 */
@@ -414,9 +407,6 @@ final class TPFWLI_Stock_Service
 		$state = strtoupper(trim((string) ($data['event_state'] ?? '')));
 		if ($state === 'ACTIVE') {
 			return $this->txn_inspect_state('open');
-		}
-		if (in_array($state, array('COMMITTED', 'ROLLED BACK'), true)) {
-			return $this->txn_inspect_state('closed');
 		}
 
 		return $this->txn_inspect_state('unknown', '');
@@ -518,6 +508,51 @@ final class TPFWLI_Stock_Service
 	}
 
 	/**
+	 * @param array{status?:string} $state
+	 */
+	private function owned_txn_ended(array $state): bool
+	{
+		if (($state['status'] ?? '') === 'closed') {
+			return true;
+		}
+		return $this->owned_txn_observed_active && ($state['status'] ?? '') !== 'open';
+	}
+
+	/**
+	 * Inspect then START only when the session is proven idle. Does not touch
+	 * an already-open or unknown outer transaction.
+	 *
+	 * @return array{ok:bool,accepted:bool,error:string,connection_unsafe:bool,still_open:bool,status:string}
+	 */
+	private function begin_stock_transaction_if_idle(): array
+	{
+		$txn_state = $this->inspect_sql_transaction();
+		if (!$txn_state['ok']) {
+			return array(
+				'ok'                => false,
+				'accepted'          => false,
+				'connection_unsafe' => false,
+				'still_open'        => false,
+				'status'            => $txn_state['status'],
+				'error'             => $txn_state['error'] !== ''
+					? $txn_state['error']
+					: __('Could not determine whether a database transaction is already open. Stock was not changed.', 'tickets-passes-legacy-importer'),
+			);
+		}
+		if ($txn_state['open']) {
+			return array(
+				'ok'                => false,
+				'accepted'          => false,
+				'connection_unsafe' => false,
+				'still_open'        => true,
+				'status'            => 'open',
+				'error'             => __('Stock reduction refused because another database transaction is already open.', 'tickets-passes-legacy-importer'),
+			);
+		}
+		return $this->begin_sql_transaction();
+	}
+
+	/**
 	 * @return array{ok:bool,accepted:bool,error:string,connection_unsafe:bool,still_open:bool,status:string}
 	 */
 	private function begin_sql_transaction(): array
@@ -538,6 +573,7 @@ final class TPFWLI_Stock_Service
 
 		$state = $this->inspect_sql_transaction();
 		if (($state['status'] ?? '') === 'open') {
+			$this->owned_txn_observed_active = true;
 			return array(
 				'ok'                => true,
 				'accepted'          => true,
@@ -573,8 +609,9 @@ final class TPFWLI_Stock_Service
 	{
 		$run   = $this->run_sql_transaction_command('COMMIT');
 		$state = $this->inspect_sql_transaction();
-		if ($run['ok'] && ($state['status'] ?? '') === 'closed') {
-			return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
+		if ($run['ok'] && $this->owned_txn_ended($state)) {
+			$this->owned_txn_observed_active = false;
+			return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => $state['status']);
 		}
 
 		$rolled = $this->rollback_sql_transaction();
@@ -615,8 +652,9 @@ final class TPFWLI_Stock_Service
 			$run        = $this->run_sql_transaction_command('ROLLBACK');
 			$last_error = $run['error'];
 			$state      = $this->inspect_sql_transaction();
-			if (($state['status'] ?? '') === 'closed') {
-				return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
+			if ($this->owned_txn_ended($state)) {
+				$this->owned_txn_observed_active = false;
+				return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => $state['status']);
 			}
 			if (($state['status'] ?? '') === 'unknown') {
 				return array(

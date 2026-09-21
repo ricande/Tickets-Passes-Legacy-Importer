@@ -69,7 +69,7 @@ if ($after_start !== 'open') {
 	fwrite(STDERR, "expected open immediately after START, got {$after_start}\n");
 	exit(1);
 }
-if (($out['after_commit']['status'] ?? '') !== 'closed' || ($out['after_rollback']['status'] ?? '') !== 'closed') {
-	fwrite(STDERR, "expected closed after COMMIT and ROLLBACK\n");
+if (($out['after_commit']['status'] ?? '') === 'open' || ($out['after_rollback']['status'] ?? '') === 'open') {
+	fwrite(STDERR, "expected not-open after COMMIT and ROLLBACK\n");
 	exit(1);
 }
