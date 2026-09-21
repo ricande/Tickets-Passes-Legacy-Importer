@@ -56,12 +56,15 @@ jobs:
       TPFWLI_MYSQL_DATABASE: tpfwli_txn
       TPFWLI_SMTP_HOST: 127.0.0.1
       TPFWLI_SMTP_PORT: '1025'
+      TPFWLI_REQUIRE_MAILPIT: '1'
     steps:
       - name: Checkout importer
-        uses: actions/checkout@v4
+        # actions/checkout v7.0.1 (Node 24). Verified tag commit in actions/checkout.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: PHP 8.3
-        uses: shivammathur/setup-php@v2
+        # shivammathur/setup-php 2.37.2. Verified tag commit in shivammathur/setup-php.
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
         with:
           php-version: '8.3'
           extensions: mysqli, mysqlnd, mbstring, xml, zip, gd, intl, curl
@@ -96,8 +99,20 @@ jobs:
       - name: PHP lint
         run: bash scripts/php-lint.sh
 
+      - name: Wait for Mailpit HTTP API
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:8025/api/v1/info; then
+              echo "mailpit_http_ready attempts=${i}"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "mailpit_http_unavailable after 20s" >&2
+          exit 1
+
       - name: PHPUnit
-        run: bash tests/run.sh
+        run: bash tests/run.sh --testdox
 
       - name: Package contract
         run: bash scripts/package-contract.sh

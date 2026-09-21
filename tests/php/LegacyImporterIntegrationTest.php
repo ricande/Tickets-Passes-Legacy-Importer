@@ -3091,6 +3091,9 @@ final class LegacyImporterIntegrationTest extends TestCase
 			'http' => array('timeout' => 2, 'ignore_errors' => true),
 		)));
 		if (!is_string($mailpit_info) || $mailpit_info === '') {
+			if (getenv('TPFWLI_REQUIRE_MAILPIT') === '1') {
+				$this->fail('Mailpit is required on 127.0.0.1:8025 but the HTTP API did not respond');
+			}
 			$this->markTestSkipped('Mailpit is not available on 127.0.0.1:8025');
 		}
 		$input = $this->valid_input(array(
