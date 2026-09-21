@@ -140,19 +140,34 @@ final class TPFWLI_Import_Repository
 		$previous_suppress = null;
 		$previous_show     = null;
 		$awaiting          = false;
+		$identity_seen     = false;
 		$identity_error    = '';
 		$exception_error   = '';
 		$watcher           = null;
 		$orders            = null;
 
+		$capture_identity_outcome = static function () use (&$awaiting, &$identity_seen, &$identity_error): void {
+			global $wpdb;
+			if (!$awaiting) {
+				return;
+			}
+			$awaiting      = false;
+			$identity_seen = true;
+			if ($identity_error !== '') {
+				return;
+			}
+			if ($wpdb instanceof wpdb) {
+				$identity_error = (string) $wpdb->last_error;
+			}
+		};
+
 		if ($wpdb instanceof wpdb) {
 			$previous_suppress = $wpdb->suppress_errors(true);
 			$previous_show     = $wpdb->show_errors(false);
-			$watcher = static function ($sql) use ($args, &$awaiting, &$identity_error) {
-				global $wpdb;
-				if ($awaiting) {
-					$identity_error = ($wpdb instanceof wpdb) ? (string) $wpdb->last_error : '';
-					$awaiting = false;
+			$watcher = static function ($sql) use ($args, &$awaiting, &$identity_seen, &$identity_error, $capture_identity_outcome) {
+				$capture_identity_outcome();
+				if ($identity_error !== '' || $identity_seen) {
+					return $sql;
 				}
 				if (is_string($sql) && self::sql_looks_like_identity_query($sql, $args)) {
 					$awaiting = true;
@@ -164,15 +179,9 @@ final class TPFWLI_Import_Repository
 
 		try {
 			$orders = wc_get_orders($args);
-			if ($awaiting && $wpdb instanceof wpdb) {
-				$identity_error = (string) $wpdb->last_error;
-				$awaiting = false;
-			}
+			$capture_identity_outcome();
 		} catch (Throwable $e) {
-			if ($awaiting && $wpdb instanceof wpdb) {
-				$identity_error = (string) $wpdb->last_error;
-				$awaiting = false;
-			}
+			$capture_identity_outcome();
 			if ($identity_error === '') {
 				$exception_error = $e->getMessage();
 			}

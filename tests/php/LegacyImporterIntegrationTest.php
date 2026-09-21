@@ -1075,6 +1075,61 @@ final class LegacyImporterIntegrationTest extends TestCase
 		});
 	}
 
+	public function test_meta_lookup_sql_error_still_stops_after_matching_followup_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-meta-count@example.com',
+			'first_name' => 'LookupMetaCount',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenMatchingSuccessfulSelect($input['import_id'], 'meta', 1, function () use ($input, $before): void {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertNull($found['order']);
+			$this->assertStringContainsString('import ID', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
+	public function test_created_via_lookup_sql_error_still_stops_after_matching_followup_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-via-count@example.com',
+			'first_name' => 'LookupViaCount',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenMatchingSuccessfulSelect($input['import_id'], 'created_via', 1, function () use ($input, $before): void {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertStringContainsString('created_via', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
+	public function test_later_create_or_resume_lookup_sql_error_still_stops_after_matching_followup_select(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-later-count@example.com',
+			'first_name' => 'LookupLaterCount',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withIdentityLookupFailureThenMatchingSuccessfulSelect($input['import_id'], 'any', 3, function () use ($input, $before): void {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		});
+	}
+
 	public function test_stale_wpdb_last_error_does_not_fail_a_successful_miss(): void
 	{
 		global $wpdb;
@@ -1298,6 +1353,70 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$wpdb->get_var('SELECT 1');
 			return $results;
 		};
+		add_filter('woocommerce_order_query', $mask, 10, 2);
+		try {
+			$callback();
+		} finally {
+			remove_filter('query', $fail, 999);
+			remove_filter('woocommerce_order_query', $mask, 10);
+		}
+	}
+
+	/**
+	 * Identity SQL failure, then a successful COUNT that still matches the identity.
+	 *
+	 * @param callable():void $callback
+	 */
+	private function withIdentityLookupFailureThenMatchingSuccessfulSelect(string $import_id, string $which, int $from_call, callable $callback): void
+	{
+		$calls = 0;
+		$fail  = static function ($sql) use ($import_id, $which, $from_call, &$calls) {
+			if (!is_string($sql) || !str_contains($sql, $import_id)) {
+				return $sql;
+			}
+			if (str_contains($sql, 'SELECT DISTINCT o.id')) {
+				return $sql;
+			}
+			if (preg_match('/SELECT\s+COUNT\s*\(/i', $sql)) {
+				return $sql;
+			}
+			$is_meta = str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID);
+			$is_via  = str_contains($sql, TPFWLI_Plugin::CREATED_VIA_PREFIX);
+			if ($which === 'meta' && !$is_meta) {
+				return $sql;
+			}
+			if ($which === 'created_via' && !$is_via) {
+				return $sql;
+			}
+			$calls++;
+			if ($calls < $from_call) {
+				return $sql;
+			}
+			return 'SELECT id FROM tpfwli_missing_identity_lookup_table WHERE id = 1';
+		};
+		$mask = static function ($results) use ($import_id, $which) {
+			global $wpdb;
+			if ($which === 'created_via') {
+				$table = $wpdb->prefix . 'wc_order_operational_data';
+				$sql   = $wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table} WHERE created_via = %s",
+					TPFWLI_Plugin::created_via($import_id)
+				);
+			} else {
+				$table = $wpdb->prefix . 'wc_orders_meta';
+				$sql   = $wpdb->prepare(
+					"SELECT COUNT(*) FROM {$table} WHERE meta_key = %s AND meta_value = %s",
+					TPFWLI_Plugin::META_IMPORT_ID,
+					$import_id
+				);
+			}
+			$count = $wpdb->get_var($sql);
+			if ($count === null || $wpdb->last_error !== '') {
+				throw new RuntimeException('Follow-up identity SELECT COUNT(*) failed: ' . (string) $wpdb->last_error);
+			}
+			return $results;
+		};
+		add_filter('query', $fail, 999);
 		add_filter('woocommerce_order_query', $mask, 10, 2);
 		try {
 			$callback();
