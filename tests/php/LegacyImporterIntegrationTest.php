@@ -2251,6 +2251,24 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
 
+		$blank = new WC_Order();
+		$blank->set_id((int) $order->get_id());
+		$blank->set_created_via('');
+		$blank->update_meta_data(TPFWLI_Plugin::META_IMPORT, '');
+		$blank->update_meta_data(TPFWLI_Plugin::META_IMPORT_ID, '');
+		$cache = wc_get_container()->get(\Automattic\WooCommerce\Caches\OrderCache::class);
+		$cache->remove((int) $order->get_id());
+		$cache->set($blank, (int) $order->get_id());
+		try {
+			$this->assertFalse($svc->filter_enabled(true, $order, $completed));
+			self::$mail = array();
+			$completed->trigger((int) $order->get_id(), $order);
+			$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		} finally {
+			$this->forgetOrderCache((int) $order->get_id());
+		}
+		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+
 		self::$mail = array();
 		$web = wc_create_order();
 		$web->set_billing_email('web-reread-control@example.com');

@@ -237,7 +237,13 @@ function tpfwli_test_run_queued_email_jobs(array $jobs, int $order_id = 0): arra
 		if ($order_id > 0 && !tpfwli_test_queued_email_belongs_to_order($action->get_args(), $order_id)) {
 			continue;
 		}
+		if ($store->get_status($id) !== ActionScheduler_Store::STATUS_PENDING) {
+			continue;
+		}
 		$runner->process_action($id, 'tpfwli-queued-email');
+		if ($store->get_status($id) !== ActionScheduler_Store::STATUS_COMPLETE) {
+			continue;
+		}
 		$ran[] = $id;
 	}
 	return $ran;

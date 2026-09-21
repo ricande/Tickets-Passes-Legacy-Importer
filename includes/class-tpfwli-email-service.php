@@ -81,7 +81,7 @@ final class TPFWLI_Email_Service
 			return $identified_import ? false : (bool) $enabled;
 		}
 		if (!$this->is_importer_order($order)) {
-			return (bool) $enabled;
+			return $identified_import ? false : (bool) $enabled;
 		}
 
 		$email_id = (is_object($email) && isset($email->id)) ? (string) $email->id : '';

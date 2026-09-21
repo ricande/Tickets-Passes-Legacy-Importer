@@ -1,0 +1,27 @@
+---
+description: After a fix, do a critical review pass before commit and the final report
+alwaysApply: true
+---
+
+# Critical review before commit
+
+After the fix, before commit and the final report:
+
+Do a separate critical review of the changes.
+Assume the solution can be wrong even if tests are green.
+
+Check especially:
+
+- Can a read error or unknown state be treated as permission?
+- Can the wrong order, email, or queue job be selected?
+- What happens on abort, retry, and a run in a new process?
+- Do the tests prove that the right operation actually ran?
+- Can a test pass because nothing ran?
+- Did the fix change previously working behavior?
+
+Search for error paths inside the current step's responsibility.
+Reproduce concrete suspicions before changing more code.
+Fix confirmed bugs and run the relevant regressions.
+
+Report which extra error paths were checked and which limitations remain.
+Do not write only "self-review complete".
