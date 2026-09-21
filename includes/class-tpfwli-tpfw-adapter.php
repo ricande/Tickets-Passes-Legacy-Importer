@@ -414,7 +414,7 @@ final class TPFWLI_Tpfw_Adapter
 			}
 			$index = (int) $parts[1];
 			$value = $data['value'] ?? '';
-			$out[$index][] = is_scalar($value) ? trim((string) $value) : '';
+			$out[$index][] = is_scalar($value) ? (string) $value : '';
 		}
 		return $out;
 	}

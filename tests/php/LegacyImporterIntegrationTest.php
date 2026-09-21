@@ -321,6 +321,117 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($fix['order'], 1);
 		$this->assertTrue($verified['ok'], implode('; ', $verified['errors']));
 		$this->assertCount(1, $verified['nanos']);
+		$this->assertSame(array($fix['nanos'][0]), $this->lineTicketCodes($fix['order'])[1] ?? array());
+	}
+
+	public function test_verify_issue_rejects_whitespace_wrapped_line_code(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-ws-wrap@example.com',
+			'first_name' => 'F9WsWrap',
+			'quantity'   => '1',
+		));
+		$order = $this->setLineTicketMeta($fix['order'], array(1 => ' ' . $fix['nanos'][0] . ' '));
+		$seen = $this->lineTicketCodes($order);
+		$this->assertSame(array(' ' . $fix['nanos'][0] . ' '), $seen[1] ?? array());
+		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($order, 1);
+		$this->assertFalse($verified['ok']);
+		$this->assertStringContainsString('one-to-one', implode(' ', $verified['errors']));
+	}
+
+	public function test_verify_issue_rejects_whitespace_suffixed_line_code(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-ws-suffix@example.com',
+			'first_name' => 'F9WsSuffix',
+			'quantity'   => '1',
+		));
+		$order = $this->setLineTicketMeta($fix['order'], array(1 => $fix['nanos'][0] . ' '));
+		$seen = $this->lineTicketCodes($order);
+		$this->assertSame(array($fix['nanos'][0] . ' '), $seen[1] ?? array());
+		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($order, 1);
+		$this->assertFalse($verified['ok']);
+		$this->assertStringContainsString('one-to-one', implode(' ', $verified['errors']));
+	}
+
+	public function test_verify_issue_rejects_whitespace_prefixed_line_code(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-ws-prefix@example.com',
+			'first_name' => 'F9WsPrefix',
+			'quantity'   => '1',
+		));
+		$order = $this->setLineTicketMeta($fix['order'], array(1 => ' ' . $fix['nanos'][0]));
+		$seen = $this->lineTicketCodes($order);
+		$this->assertSame(array(' ' . $fix['nanos'][0]), $seen[1] ?? array());
+		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($order, 1);
+		$this->assertFalse($verified['ok']);
+		$this->assertStringContainsString('one-to-one', implode(' ', $verified['errors']));
+	}
+
+	public function test_whitespace_line_code_blocks_resume_without_mail_tickets_or_stock(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-ws-resume@example.com',
+			'first_name' => 'F9WsResume',
+			'quantity'   => '1',
+		));
+		$order = $this->setLineTicketMeta($fix['order'], array(1 => ' ' . $fix['nanos'][0] . ' '));
+		$order->update_meta_data(TPFWLI_Plugin::META_EMAIL_STAGE, 'not_sent');
+		$order->save();
+		$tickets_before = $this->count_tickets_for_order((int) $order->get_id());
+		$stock_before = $this->db_product_stock(self::$ticket_id);
+		self::$mail = array();
+
+		$resume = (new TPFWLI_Orchestrator())->run($fix['input'], 'resume');
+		$this->assertFalse($resume['ok']);
+		$fresh = wc_get_order($order->get_id());
+		$this->assertSame('not_sent', (string) $fresh->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame('issued', (string) $fresh->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame($tickets_before, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame($stock_before, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(0, $this->customerMailCount((string) $fix['input']['email']));
+
+		self::$mail = array();
+		$retry = (new TPFWLI_Orchestrator())->run($fix['input'], 'retry_email');
+		$this->assertFalse($retry['ok']);
+		$this->assertSame('not_sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame('issued', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame($tickets_before, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame($stock_before, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(0, $this->customerMailCount((string) $fix['input']['email']));
+	}
+
+	public function test_verify_issue_rejects_duplicate_meta_rows_same_value(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-dup-aa@example.com',
+			'first_name' => 'F9DupAA',
+			'quantity'   => '1',
+		));
+		$order = $this->addDuplicateLineTicketMeta($fix['order'], $fix['nanos'][0], $fix['nanos'][0]);
+		$seen = $this->lineTicketCodes($order);
+		$this->assertCount(2, $seen[1] ?? array(), 'line_ticket_codes must see both physical tpfw_ticket_id_1 rows');
+		$this->assertSame(array($fix['nanos'][0], $fix['nanos'][0]), $seen[1]);
+		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($order, 1);
+		$this->assertFalse($verified['ok']);
+		$this->assertMatchesRegularExpression('/empty or repeated|unique code per position/', implode(' ', $verified['errors']));
+	}
+
+	public function test_verify_issue_rejects_duplicate_meta_rows_different_values(): void
+	{
+		$fix = $this->confirmIssuedImport(array(
+			'email'      => 'f9-dup-ab@example.com',
+			'first_name' => 'F9DupAB',
+			'quantity'   => '1',
+		));
+		$order = $this->addDuplicateLineTicketMeta($fix['order'], $fix['nanos'][0], $fix['nanos'][0] . 'X');
+		$seen = $this->lineTicketCodes($order);
+		$this->assertCount(2, $seen[1] ?? array(), 'line_ticket_codes must see both physical tpfw_ticket_id_1 rows');
+		$this->assertSame(array($fix['nanos'][0], $fix['nanos'][0] . 'X'), $seen[1]);
+		$verified = (new TPFWLI_Tpfw_Adapter())->verify_issue($order, 1);
+		$this->assertFalse($verified['ok']);
+		$this->assertMatchesRegularExpression('/empty or repeated|unique code per position/', implode(' ', $verified['errors']));
 	}
 
 	public function test_verify_issue_rejects_extra_line_ticket_meta(): void
@@ -4170,6 +4281,38 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$item->save();
 		$fresh = wc_get_order($order->get_id());
 		$this->assertInstanceOf(WC_Order::class, $fresh);
+		return $fresh;
+	}
+
+	/**
+	 * @return array<int,list<string>>
+	 */
+	private function lineTicketCodes(WC_Order $order): array
+	{
+		$item = array_values($order->get_items('line_item'))[0];
+		$ref = new ReflectionMethod(TPFWLI_Tpfw_Adapter::class, 'line_ticket_codes');
+		$codes = $ref->invoke(new TPFWLI_Tpfw_Adapter(), $item);
+		$this->assertIsArray($codes);
+		return $codes;
+	}
+
+	private function addDuplicateLineTicketMeta(WC_Order $order, string $first, string $second): WC_Order
+	{
+		$item = array_values($order->get_items('line_item'))[0];
+		$item->delete_meta_data('tpfw_ticket_id_1');
+		$item->add_meta_data('tpfw_ticket_id_1', $first, false);
+		$item->add_meta_data('tpfw_ticket_id_1', $second, false);
+		$item->save();
+		$fresh = wc_get_order($order->get_id());
+		$this->assertInstanceOf(WC_Order::class, $fresh);
+		global $wpdb;
+		$rows = $wpdb->get_results($wpdb->prepare(
+			'SELECT meta_id FROM %i WHERE order_item_id = %d AND meta_key = %s',
+			$wpdb->prefix . 'woocommerce_order_itemmeta',
+			array_values($fresh->get_items('line_item'))[0]->get_id(),
+			'tpfw_ticket_id_1'
+		));
+		$this->assertCount(2, $rows, 'WooCommerce must persist two physical tpfw_ticket_id_1 rows');
 		return $fresh;
 	}
 
