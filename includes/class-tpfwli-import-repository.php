@@ -93,30 +93,34 @@ final class TPFWLI_Import_Repository
 
 		$queried = $this->query_import_list_page($page, $per_page);
 		if (!$queried['ok']) {
-			$this->last_error = $queried['error'];
-			return array(
-				'ok'     => false,
-				'orders' => array(),
-				'total'  => 0,
-				'pages'  => 0,
-				'page'   => $page,
-				'error'  => $this->last_error,
-			);
+			return $this->list_read_error($page, $queried['error']);
+		}
+
+		if ($queried['ids'] !== array() && ((int) $queried['total'] < 1 || (int) $queried['pages'] < 1)) {
+			return $this->list_read_error($page, __('Could not read the legacy import list.', 'tickets-passes-legacy-importer'));
+		}
+
+		if ($page > 1 && $queried['ids'] === array() && (int) $queried['total'] === 0 && (int) $queried['pages'] === 0) {
+			$head = $this->query_import_list_page(1, 1);
+			if (!$head['ok']) {
+				return $this->list_read_error($page, $head['error']);
+			}
+			if ($head['ids'] !== array() && (int) $head['total'] < 1) {
+				return $this->list_read_error($page, __('Could not read the legacy import list.', 'tickets-passes-legacy-importer'));
+			}
+			$total = (int) $head['total'];
+			$empty['ok']     = true;
+			$empty['orders'] = array();
+			$empty['total']  = $total;
+			$empty['pages']  = $total > 0 ? (int) ceil($total / $per_page) : 0;
+			return $empty;
 		}
 
 		$out = array();
 		foreach ($queried['ids'] as $id) {
 			$order = wc_get_order((int) $id);
 			if (!$order instanceof WC_Order) {
-				$this->last_error = __('Could not read the legacy import list.', 'tickets-passes-legacy-importer');
-				return array(
-					'ok'     => false,
-					'orders' => array(),
-					'total'  => 0,
-					'pages'  => 0,
-					'page'   => $page,
-					'error'  => $this->last_error,
-				);
+				return $this->list_read_error($page, __('Could not read the legacy import list.', 'tickets-passes-legacy-importer'));
 			}
 			$out[] = $order;
 		}
@@ -126,6 +130,22 @@ final class TPFWLI_Import_Repository
 		$empty['total']  = $queried['total'];
 		$empty['pages']  = $queried['pages'];
 		return $empty;
+	}
+
+	/**
+	 * @return array{ok:bool,orders:WC_Order[],total:int,pages:int,page:int,error:string}
+	 */
+	private function list_read_error(int $page, string $error): array
+	{
+		$this->last_error = $error !== '' ? $error : __('Could not read the legacy import list.', 'tickets-passes-legacy-importer');
+		return array(
+			'ok'     => false,
+			'orders' => array(),
+			'total'  => 0,
+			'pages'  => 0,
+			'page'   => $page,
+			'error'  => $this->last_error,
+		);
 	}
 
 	/**
@@ -152,19 +172,17 @@ final class TPFWLI_Import_Repository
 		$previous_suppress = null;
 		$previous_show     = null;
 		$awaiting          = false;
-		$seen              = false;
 		$sql_error         = '';
 		$exception_error   = '';
 		$watcher           = null;
 		$result            = null;
 
-		$capture = static function () use (&$awaiting, &$seen, &$sql_error): void {
+		$capture = static function () use (&$awaiting, &$sql_error): void {
 			global $wpdb;
 			if (!$awaiting) {
 				return;
 			}
 			$awaiting = false;
-			$seen     = true;
 			if ($sql_error !== '') {
 				return;
 			}
@@ -176,9 +194,9 @@ final class TPFWLI_Import_Repository
 		if ($wpdb instanceof wpdb) {
 			$previous_suppress = $wpdb->suppress_errors(true);
 			$previous_show     = $wpdb->show_errors(false);
-			$watcher = static function ($sql) use (&$awaiting, &$seen, &$sql_error, $capture) {
+			$watcher = static function ($sql) use (&$awaiting, &$sql_error, $capture) {
 				$capture();
-				if ($sql_error !== '' || $seen) {
+				if ($sql_error !== '') {
 					return $sql;
 				}
 				if (is_string($sql) && self::sql_looks_like_import_list_query($sql)) {

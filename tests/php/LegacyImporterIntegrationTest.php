@@ -2360,6 +2360,64 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$outside = $this->adminOverviewHtml(9999);
 		$this->assertStringContainsString('no imports on this page', strtolower($outside));
 		$this->assertStringNotContainsString('No legacy imports yet', $outside);
+		$this->assertStringContainsString('Go to the last page', $outside);
+		$this->assertStringNotContainsString('Go to the first page', $outside);
+		$this->assertGreaterThan(1, (int) $list1['pages']);
+		$this->assertMatchesRegularExpression('/tpfwli_page=' . (int) $list1['pages'] . '(&amp;|&|")/', $outside);
+		$this->assertDoesNotMatchRegularExpression('/tpfwli_page=1(&amp;|&|")/', $outside);
+	}
+
+	public function test_overview_count_error_is_not_an_empty_list(): void
+	{
+		$this->assertGreaterThan(0, $this->count_import_orders());
+		$kinds = array();
+		$fail = $this->failImportListCountQueries($kinds);
+		try {
+			$list = (new TPFWLI_Import_Repository())->list_imports(1, 50);
+			global $wpdb;
+			$this->assertSame('1', (string) $wpdb->get_var('SELECT 1'));
+			$this->assertContains(false, $kinds, 'page ID query must run');
+			$this->assertContains(true, $kinds, 'COUNT query must run');
+			$this->assertFalse($list['ok']);
+			$this->assertSame(array(), $list['orders']);
+			$this->assertSame(0, (int) $list['total']);
+			$this->assertSame(0, (int) $list['pages']);
+			$this->assertStringContainsString('Could not read the legacy import list', (string) $list['error']);
+			$html = $this->adminOverviewHtml(1);
+			$this->assertStringContainsString('Could not read the legacy import list', $html);
+			$this->assertStringNotContainsString('No legacy imports yet', $html);
+			$this->assertDoesNotMatchRegularExpression('/Page \d+ of \d+/', $html);
+		} finally {
+			remove_filter('query', $fail, 999);
+		}
+	}
+
+	public function test_overview_empty_list_and_first_page_link(): void
+	{
+		$empty = static function ($pre, $query, $sql) {
+			if (!is_string($sql) || !str_contains($sql, TPFWLI_Plugin::META_IMPORT) || str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID)) {
+				return $pre;
+			}
+			return array(array(), 0, 0);
+		};
+		add_filter('woocommerce_hpos_pre_query', $empty, 10, 3);
+		try {
+			$list = (new TPFWLI_Import_Repository())->list_imports(1, 50);
+			$this->assertTrue($list['ok'], $list['error'] ?? '');
+			$this->assertSame(array(), $list['orders']);
+			$this->assertSame(0, (int) $list['total']);
+			$html = $this->adminOverviewHtml(1);
+			$this->assertStringContainsString('No legacy imports yet', $html);
+			$this->assertStringNotContainsString('Could not read the legacy import list', $html);
+			$high = $this->adminOverviewHtml(9);
+			$this->assertStringContainsString('no imports on this page', strtolower($high));
+			$this->assertStringContainsString('Go to the first page', $high);
+			$this->assertStringContainsString('tpfwli_page=1', $high);
+			$this->assertStringNotContainsString('Go to the last page', $high);
+			$this->assertStringNotContainsString('No legacy imports yet', $high);
+		} finally {
+			remove_filter('woocommerce_hpos_pre_query', $empty, 10);
+		}
 	}
 
 	public function test_overview_read_error_is_not_an_empty_list(): void
@@ -4979,6 +5037,31 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$order->update_meta_data(TPFWLI_Plugin::META_EMAIL_STAGE, 'sent');
 		$order->update_meta_data(TPFWLI_Plugin::META_STOCK_STAGE, 'reduced');
 		return (int) $order->save();
+	}
+
+	/**
+	 * @param list<bool>|null $kinds
+	 */
+	private function failImportListCountQueries(?array &$kinds = null): callable
+	{
+		$filter = static function ($sql) use (&$kinds) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			if (!str_contains($sql, TPFWLI_Plugin::META_IMPORT) || str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID)) {
+				return $sql;
+			}
+			$is_count = (bool) preg_match('/\bCOUNT\s*\(/i', $sql);
+			if (is_array($kinds)) {
+				$kinds[] = $is_count;
+			}
+			if (!$is_count) {
+				return $sql;
+			}
+			return 'SELECT COUNT(*) FROM tpfwli_missing_import_count';
+		};
+		add_filter('query', $filter, 999);
+		return $filter;
 	}
 
 	private function adminOverviewHtml(int $page): string

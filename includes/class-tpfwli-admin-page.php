@@ -464,8 +464,12 @@ final class TPFWLI_Admin_Page
 			return;
 		}
 		if ($total === 0 || $page > max(1, $pages)) {
+			$last  = max(1, $pages);
+			$label = $last === 1
+				? __('Go to the first page', 'tickets-passes-legacy-importer')
+				: __('Go to the last page', 'tickets-passes-legacy-importer');
 			echo '<div class="notice notice-warning"><p>' . esc_html__('There are no imports on this page.', 'tickets-passes-legacy-importer') . '</p></div>';
-			echo '<p><a href="' . esc_url($this->url(array('view' => 'overview', self::PAGE_QUERY => (string) max(1, $pages)))) . '">' . esc_html__('Go to the last page', 'tickets-passes-legacy-importer') . '</a></p>';
+			echo '<p><a href="' . esc_url($this->url(array('view' => 'overview', self::PAGE_QUERY => (string) $last))) . '">' . esc_html($label) . '</a></p>';
 			return;
 		}
 
