@@ -10,8 +10,11 @@ defined('ABSPATH') || exit;
  *
  * Transaction state is open, closed, or unknown. Empty INNODB_TRX is never
  * treated as closed. A historical COMMITTED or ROLLED BACK Performance Schema
- * event is not proof that the session is idle. Responsibility is taken as
- * soon as START is accepted.
+ * event is not proof that the session is idle. A previously observed ACTIVE
+ * plus a later unknown is not proof that the transaction ended.
+ * Responsibility is taken as soon as START is accepted. MySQL cannot prove
+ * idle, so new stock reductions are refused there. MariaDB is the supported
+ * integration path.
  * An unconfirmed rollback isolates the database session so later business
  * writes cannot continue.
  *
@@ -21,8 +24,6 @@ defined('ABSPATH') || exit;
  */
 final class TPFWLI_Stock_Service
 {
-	private bool $owned_txn_observed_active = false;
-
 	public function is_reduced(WC_Order $order): bool
 	{
 		$order = wc_get_order($order->get_id());
@@ -508,17 +509,6 @@ final class TPFWLI_Stock_Service
 	}
 
 	/**
-	 * @param array{status?:string} $state
-	 */
-	private function owned_txn_ended(array $state): bool
-	{
-		if (($state['status'] ?? '') === 'closed') {
-			return true;
-		}
-		return $this->owned_txn_observed_active && ($state['status'] ?? '') !== 'open';
-	}
-
-	/**
 	 * Inspect then START only when the session is proven idle. Does not touch
 	 * an already-open or unknown outer transaction.
 	 *
@@ -573,7 +563,6 @@ final class TPFWLI_Stock_Service
 
 		$state = $this->inspect_sql_transaction();
 		if (($state['status'] ?? '') === 'open') {
-			$this->owned_txn_observed_active = true;
 			return array(
 				'ok'                => true,
 				'accepted'          => true,
@@ -609,36 +598,34 @@ final class TPFWLI_Stock_Service
 	{
 		$run   = $this->run_sql_transaction_command('COMMIT');
 		$state = $this->inspect_sql_transaction();
-		if ($run['ok'] && $this->owned_txn_ended($state)) {
-			$this->owned_txn_observed_active = false;
-			return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => $state['status']);
+		if ($run['ok'] && ($state['status'] ?? '') === 'closed') {
+			return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
 		}
 
 		$rolled = $this->rollback_sql_transaction();
-		$status = $rolled['status'] ?? 'unknown';
-		if (!$run['ok']) {
-			return array(
-				'ok'         => false,
-				'still_open' => !empty($rolled['still_open']),
-				'status'     => $status,
-				'error'      => $run['error'] !== ''
-					? $run['error']
-					: __('COMMIT failed. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'),
-			);
+		$error  = !$run['ok']
+			? ($run['error'] !== ''
+				? $run['error']
+				: __('COMMIT failed. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'))
+			: (($state['status'] ?? '') === 'unknown'
+				? __('Stock reduction commit outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer')
+				: __('COMMIT did not close the database transaction. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'));
+		if (!$rolled['ok'] && ($rolled['error'] ?? '') !== '' && $rolled['error'] !== $error) {
+			$error .= ' ' . $rolled['error'];
 		}
 		if (($state['status'] ?? '') === 'unknown') {
 			return array(
 				'ok'         => false,
-				'still_open' => !empty($rolled['still_open']) || $status === 'unknown',
-				'status'     => $status,
-				'error'      => __('Stock reduction commit outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer'),
+				'still_open' => true,
+				'status'     => 'unknown',
+				'error'      => $error,
 			);
 		}
 		return array(
 			'ok'         => false,
-			'still_open' => !empty($rolled['still_open']),
-			'status'     => $status,
-			'error'      => __('COMMIT did not close the database transaction. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'),
+			'still_open' => !empty($rolled['still_open']) || (($rolled['status'] ?? '') === 'unknown'),
+			'status'     => $rolled['status'] ?? 'unknown',
+			'error'      => $error,
 		);
 	}
 
@@ -648,22 +635,27 @@ final class TPFWLI_Stock_Service
 	private function rollback_sql_transaction(): array
 	{
 		$last_error = '';
+		$last_status = 'open';
 		for ($attempt = 0; $attempt < 2; $attempt++) {
-			$run        = $this->run_sql_transaction_command('ROLLBACK');
-			$last_error = $run['error'];
-			$state      = $this->inspect_sql_transaction();
-			if ($this->owned_txn_ended($state)) {
-				$this->owned_txn_observed_active = false;
-				return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => $state['status']);
+			$run         = $this->run_sql_transaction_command('ROLLBACK');
+			$last_error  = $run['error'];
+			$state       = $this->inspect_sql_transaction();
+			$last_status = (string) ($state['status'] ?? 'unknown');
+			if ($last_status === 'closed') {
+				return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
 			}
-			if (($state['status'] ?? '') === 'unknown') {
-				return array(
-					'ok'         => false,
-					'still_open' => true,
-					'status'     => 'unknown',
-					'error'      => __('Stock reduction was interrupted and the rollback outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer'),
-				);
+		}
+		if ($last_status === 'unknown') {
+			$error = __('Stock reduction was interrupted and the rollback outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer');
+			if ($last_error !== '') {
+				$error .= ' ' . $last_error;
 			}
+			return array(
+				'ok'         => false,
+				'still_open' => true,
+				'status'     => 'unknown',
+				'error'      => $error,
+			);
 		}
 		return array(
 			'ok'         => false,

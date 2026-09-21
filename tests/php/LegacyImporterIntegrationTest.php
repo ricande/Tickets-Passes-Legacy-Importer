@@ -885,6 +885,141 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
 	}
 
+	public function test_unconfirmed_rollback_unknown_inspect_does_not_write_follow_up_state(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'txn-fatal-unknown@example.com',
+			'first_name' => 'TxnFatalUnk',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$order_id = (int) $order->get_id();
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$other = $this->secondDb();
+		$notes_before = $this->count_order_notes_other($other, $order_id);
+		$writes = array();
+		$after_crash = false;
+		$fail_rollback = $this->failSqlCommands(array('ROLLBACK'));
+		$fail_inspect = $this->failTxnInspectWhen(static function () use (&$after_crash): bool {
+			return $after_crash;
+		});
+		$spy = static function ($sql) use (&$writes, &$after_crash) {
+			if ($after_crash && is_string($sql) && preg_match('/^\s*(INSERT|UPDATE|REPLACE|DELETE)/i', $sql)) {
+				$writes[] = $sql;
+			}
+			return $sql;
+		};
+		$crash = static function (string $point) use (&$after_crash): void {
+			if ($point === 'after_product_stock') {
+				$after_crash = true;
+				throw new RuntimeException('stock-checkpoint:after_product_stock');
+			}
+		};
+		add_filter('query', $spy, 1000);
+		add_action('tpfwli_stock_checkpoint', $crash, 10, 1);
+		$GLOBALS['wpdb']->suppress_errors(true);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $crash, 10);
+			remove_filter('query', $spy, 1000);
+			remove_filter('query', $fail_inspect, 998);
+			remove_filter('query', $fail_rollback, 999);
+			$GLOBALS['wpdb']->suppress_errors(false);
+		}
+		$joined = implode(' ', $result['errors'] ?? array());
+		$this->assertFalse($result['ok']);
+		$this->assertStringContainsString('stock-checkpoint:after_product_stock', $joined);
+		$this->assertTrue((bool) preg_match('/ROLLBACK|uncertain|isolated/i', $joined), $joined);
+		$this->assertTrue(TPFWLI_Database_Session::is_quarantined());
+		$this->assertTrue(empty($GLOBALS['wpdb']->dbh) || !$GLOBALS['wpdb']->ready);
+		$follow_up = array_values(array_filter($writes, static function ($sql) {
+			return str_contains($sql, '_tpfwli_stock_stage')
+				|| str_contains($sql, '_tpfwli_issue_stage')
+				|| str_contains($sql, '_tpfwli_email_stage')
+				|| str_contains($sql, 'comment_content')
+				|| str_contains($sql, 'wp_comments');
+		}));
+		$this->assertSame(array(), $follow_up, implode("\n", $follow_up));
+		$this->assertSame($start_stock, (int) $other->get_var($other->prepare(
+			"SELECT meta_value FROM {$other->postmeta} WHERE post_id = %d AND meta_key = %s",
+			self::$ticket_id,
+			'_stock'
+		)));
+		$this->assertNotSame('failed', $this->db_stock_stage_other($other, $order_id));
+		$this->assertSame($notes_before, $this->count_order_notes_other($other, $order_id));
+		$this->assertSame(0, (int) $other->get_var($other->prepare(
+			'SELECT COUNT(*) FROM `' . $other->prefix . 'tpfw_tickets` WHERE order_id = %d AND deleted IS NULL',
+			$order_id
+		)));
+		TPFWLI_Database_Session::reset_for_tests();
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_unknown_after_commit_inspect_is_not_verified(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'txn-commit-unknown@example.com',
+			'first_name' => 'TxnCommitUnk',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$order_id = (int) $order->get_id();
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$other = $this->secondDb();
+		$seen_commit = false;
+		$filter = static function ($sql) use (&$seen_commit) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			if (strtoupper(trim($sql)) === 'COMMIT') {
+				$seen_commit = true;
+				return $sql;
+			}
+			if (
+				$seen_commit
+				&& (
+					str_contains($sql, 'in_transaction')
+					|| str_contains($sql, 'INNODB_TRX')
+					|| str_contains($sql, 'events_transactions_current')
+				)
+			) {
+				return 'SELECT tpfwli_missing_txn_state FROM dual';
+			}
+			return $sql;
+		};
+		add_filter('query', $filter, 999);
+		$GLOBALS['wpdb']->suppress_errors(true);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_filter('query', $filter, 999);
+			$GLOBALS['wpdb']->suppress_errors(false);
+		}
+		$joined = implode(' ', $result['errors'] ?? array());
+		$this->assertFalse($result['ok']);
+		$this->assertTrue($seen_commit);
+		$this->assertTrue((bool) preg_match('/uncertain|isolated|COMMIT/i', $joined), $joined);
+		$this->assertTrue(TPFWLI_Database_Session::is_quarantined());
+		$this->assertSame(0, (int) $other->get_var($other->prepare(
+			'SELECT COUNT(*) FROM `' . $other->prefix . 'tpfw_tickets` WHERE order_id = %d AND deleted IS NULL',
+			$order_id
+		)));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertNotSame('reduced', $this->db_stock_stage_other($other, $order_id));
+		$this->assertSame($start_stock - 2, (int) $other->get_var($other->prepare(
+			"SELECT meta_value FROM {$other->postmeta} WHERE post_id = %d AND meta_key = %s",
+			self::$ticket_id,
+			'_stock'
+		)));
+		TPFWLI_Database_Session::reset_for_tests();
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock($order_id));
+		$this->assertSame(2, $this->count_tickets_for_order($order_id));
+	}
+
 	public function test_wc_order_item_raw_meta_cache_is_cleared_after_rollback(): void
 	{
 		$input = $this->valid_input(array(
@@ -947,6 +1082,8 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$idle_gate = $this->callStockPrivate($service, 'begin_stock_transaction_if_idle');
 			$this->assertFalse($idle_gate['ok'], wp_json_encode($idle_gate));
 			$this->assertFalse($idle_gate['accepted']);
+			// MySQL idle cannot be proven; stock START is refused. Helpers below
+			// only show that ACTIVE is still visible and that unknown stays unknown.
 
 			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
 			$this->assertTrue($started['ok'], $started['error'] ?? '');
@@ -957,16 +1094,18 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$this->assertTrue(is_numeric($trx));
 
 			$committed = $this->callStockPrivate($service, 'commit_sql_transaction');
-			$this->assertTrue($committed['ok'], $committed['error'] ?? '');
+			$this->assertFalse($committed['ok'], wp_json_encode($committed));
+			$this->assertSame('unknown', $committed['status'], wp_json_encode($committed));
 			$after_commit = $this->callStockPrivate($service, 'inspect_sql_transaction');
-			$this->assertNotSame('open', $after_commit['status'], wp_json_encode($after_commit));
+			$this->assertSame('unknown', $after_commit['status'], wp_json_encode($after_commit));
 
 			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
 			$this->assertTrue($started['ok'], $started['error'] ?? '');
 			$rolled = $this->callStockPrivate($service, 'rollback_sql_transaction');
-			$this->assertTrue($rolled['ok'], $rolled['error'] ?? '');
+			$this->assertFalse($rolled['ok'], wp_json_encode($rolled));
+			$this->assertSame('unknown', $rolled['status'], wp_json_encode($rolled));
 			$after_rollback = $this->callStockPrivate($service, 'inspect_sql_transaction');
-			$this->assertNotSame('open', $after_rollback['status'], wp_json_encode($after_rollback));
+			$this->assertSame('unknown', $after_rollback['status'], wp_json_encode($after_rollback));
 		} finally {
 			$mysql->query('ROLLBACK');
 			$mysql->suppress_errors(false);
@@ -2635,6 +2774,25 @@ final class LegacyImporterIntegrationTest extends TestCase
 	{
 		global $wpdb;
 		return (string) $wpdb->get_var('SELECT @@SESSION.in_transaction');
+	}
+
+	private function failTxnInspectWhen(callable $active): callable
+	{
+		$filter = static function ($sql) use ($active) {
+			if (!is_string($sql) || !$active()) {
+				return $sql;
+			}
+			if (
+				!str_contains($sql, 'in_transaction')
+				&& !str_contains($sql, 'INNODB_TRX')
+				&& !str_contains($sql, 'events_transactions_current')
+			) {
+				return $sql;
+			}
+			return 'SELECT tpfwli_missing_txn_state FROM dual';
+		};
+		add_filter('query', $filter, 998);
+		return $filter;
 	}
 
 	private function forceTxnInspectAfterFirst(string $mode): callable
