@@ -27,6 +27,10 @@ final class TPFWLI_Import_Lock
 		if ($this->raw !== '1' && $this->raw !== 1) {
 			return;
 		}
+		if (class_exists('TPFWLI_Database_Session') && TPFWLI_Database_Session::is_quarantined()) {
+			$this->raw = '0';
+			return;
+		}
 		$this->wpdb->get_var($this->wpdb->prepare('SELECT RELEASE_LOCK(%s)', $this->name));
 		$this->raw = '0';
 	}

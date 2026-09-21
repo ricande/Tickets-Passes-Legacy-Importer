@@ -8,6 +8,11 @@ defined('ABSPATH') || exit;
  * committed together after a verified START TRANSACTION. Ticket issue and
  * customer email stay outside this transaction and require a verified COMMIT.
  *
+ * Transaction state is open, closed, or unknown. Empty INNODB_TRX is never
+ * treated as closed. Responsibility is taken as soon as START is accepted.
+ * An unconfirmed rollback isolates the database session so later business
+ * writes cannot continue.
+ *
  * Rollback is confirmed from the closed transaction plus this import's own
  * flag and _reduced_stock. A later sale that changes the product balance after
  * the row lock is released is not treated as a failed restore.
@@ -105,17 +110,22 @@ final class TPFWLI_Stock_Service
 			return $fail(__('Stock is no longer managed on this product.', 'tickets-passes-legacy-importer'), null);
 		}
 
-		$txn_open     = false;
+		$txn_owned    = false;
 		$locked_stock = null;
 		$saw_product  = false;
 		$on_product   = null;
 		$on_line      = null;
+		$fatal        = null;
 		try {
 			$begin = $this->begin_sql_transaction();
+			$txn_owned = !empty($begin['accepted']);
 			if (!$begin['ok']) {
+				if (!empty($begin['connection_unsafe'])) {
+					return $this->fail_fatal($begin['error'], $begin, $fail);
+				}
+				$txn_owned = false;
 				return $fail($begin['error']);
 			}
-			$txn_open = true;
 
 			$locked_stock = $this->lock_product_stock($product_id);
 			if ($locked_stock === null) {
@@ -169,16 +179,23 @@ final class TPFWLI_Stock_Service
 
 			$commit = $this->commit_sql_transaction();
 			if (!$commit['ok']) {
-				$txn_open = !empty($commit['still_open']);
+				$txn_owned = !empty($commit['still_open']) || (($commit['status'] ?? '') === 'unknown');
 				$this->forget_stock_runtime($order_id, $product_id);
-				if (!$txn_open && !$this->import_reduction_cleared($order_id, $product_id, $quantity)) {
+				if ($txn_owned) {
+					return $this->fail_fatal(
+						__('Stock reduction commit failed.', 'tickets-passes-legacy-importer'),
+						$commit,
+						$fail
+					);
+				}
+				if (!$this->import_reduction_cleared($order_id, $product_id, $quantity)) {
 					return $fail(
 						__('Stock reduction commit failed and the importer order still looks reduced. Tickets and email were not sent.', 'tickets-passes-legacy-importer')
 					);
 				}
 				return $fail($commit['error']);
 			}
-			$txn_open = false;
+			$txn_owned = false;
 			$this->forget_stock_runtime($order_id, $product_id);
 
 			$order = wc_get_order($order_id);
@@ -197,13 +214,14 @@ final class TPFWLI_Stock_Service
 			$message = $e->getMessage() !== ''
 				? $e->getMessage()
 				: __('Stock reduction failed.', 'tickets-passes-legacy-importer');
-			if ($txn_open) {
+			if ($txn_owned) {
 				$rolled = $this->rollback_sql_transaction();
-				$txn_open = !empty($rolled['still_open']);
+				$txn_owned = !empty($rolled['still_open']) || (($rolled['status'] ?? '') === 'unknown');
 				$this->forget_stock_runtime($order_id, $product_id);
 				if (!$rolled['ok']) {
-					return $fail($rolled['error']);
+					return $this->fail_fatal($message, $rolled, $fail);
 				}
+				$txn_owned = false;
 				if (!$this->import_reduction_cleared($order_id, $product_id, $quantity)) {
 					return $fail(
 						__('Stock reduction was rolled back but the importer order still looks reduced. Tickets and email were not sent.', 'tickets-passes-legacy-importer')
@@ -212,9 +230,17 @@ final class TPFWLI_Stock_Service
 			}
 			return $fail($message);
 		} finally {
-			if ($txn_open) {
-				$this->rollback_sql_transaction();
+			if ($txn_owned) {
+				$rolled = $this->rollback_sql_transaction();
 				$this->forget_stock_runtime($order_id, $product_id);
+				if (!$rolled['ok']) {
+					$fatal = $this->fail_fatal(
+						__('Stock reduction was interrupted.', 'tickets-passes-legacy-importer'),
+						$rolled,
+						$fail
+					);
+				}
+				$txn_owned = false;
 			}
 			if (is_callable($on_product)) {
 				remove_action('woocommerce_product_set_stock', $on_product, 1);
@@ -222,6 +248,9 @@ final class TPFWLI_Stock_Service
 			if (is_callable($on_line)) {
 				remove_action('woocommerce_reduce_order_stock', $on_line, 1);
 			}
+		}
+		if (is_array($fatal)) {
+			return $fatal;
 		}
 	}
 
@@ -310,16 +339,15 @@ final class TPFWLI_Stock_Service
 	}
 
 	/**
-	 * @return array{ok:bool,open:bool,error:string}
+	 * @return array{ok:bool,open:bool,status:'open'|'closed'|'unknown',error:string}
 	 */
 	private function inspect_sql_transaction(): array
 	{
 		global $wpdb;
 		if (!$wpdb instanceof wpdb) {
-			return array(
-				'ok'    => false,
-				'open'  => false,
-				'error' => __('Could not inspect the database transaction state.', 'tickets-passes-legacy-importer'),
+			return $this->txn_inspect_state(
+				'unknown',
+				__('Could not inspect the database transaction state.', 'tickets-passes-legacy-importer')
 			);
 		}
 
@@ -327,19 +355,80 @@ final class TPFWLI_Stock_Service
 
 		$session = $this->sql_scalar('SELECT @@SESSION.in_transaction');
 		if ($session['ok'] && $this->is_bool_flag($session['value'])) {
-			return array('ok' => true, 'open' => $this->flag_is_true($session['value']), 'error' => '');
+			return $this->txn_inspect_state($this->flag_is_true($session['value']) ? 'open' : 'closed');
 		}
 
-		$trx = $this->sql_scalar('SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()');
-		if ($trx['ok'] && is_numeric($trx['value'])) {
-			return array('ok' => true, 'open' => (int) $trx['value'] > 0, 'error' => '');
+		if ($this->performance_schema_transactions_enabled()) {
+			$ps = $this->sql_optional_scalar(
+				'SELECT STATE FROM performance_schema.events_transactions_current
+				WHERE THREAD_ID = (
+					SELECT THREAD_ID FROM performance_schema.threads
+					WHERE PROCESSLIST_ID = CONNECTION_ID()
+				)'
+			);
+			if ($ps['ok']) {
+				$state = strtoupper(trim((string) $ps['value']));
+				if ($state === '') {
+					return $this->txn_inspect_state('closed');
+				}
+				if ($state === 'ACTIVE') {
+					return $this->txn_inspect_state('open');
+				}
+				if (in_array($state, array('COMMITTED', 'ROLLED BACK'), true)) {
+					return $this->txn_inspect_state('closed');
+				}
+			}
 		}
 
-		$detail = $session['error'] !== '' ? $session['error'] : $trx['error'];
+		$trx = $this->sql_optional_scalar('SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()');
+		if ($trx['ok'] && is_numeric($trx['value']) && (int) $trx['value'] > 0) {
+			return $this->txn_inspect_state('open');
+		}
+
+		$detail = $session['error'] !== '';
+		return $this->txn_inspect_state('unknown', $detail ? $unknown . ' ' . $session['error'] : $unknown);
+	}
+
+	private function performance_schema_transactions_enabled(): bool
+	{
+		$enabled = $this->sql_optional_scalar(
+			"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_transactions_current'"
+		);
+		return $enabled['ok'] && strtoupper((string) $enabled['value']) === 'YES';
+	}
+
+	/**
+	 * @return array{ok:bool,value:mixed,error:string}
+	 */
+	private function sql_optional_scalar(string $sql): array
+	{
+		global $wpdb;
+		$previous_suppress = $wpdb->suppress_errors(true);
+		$previous_show     = $wpdb->show_errors(false);
+		try {
+			$value = $wpdb->get_var($sql);
+			$error = (string) $wpdb->last_error;
+			if ($error !== '') {
+				return array('ok' => false, 'value' => null, 'error' => $error);
+			}
+			return array('ok' => true, 'value' => $value, 'error' => '');
+		} finally {
+			$wpdb->suppress_errors((bool) $previous_suppress);
+			$wpdb->show_errors((bool) $previous_show);
+		}
+	}
+
+	/**
+	 * @param 'open'|'closed'|'unknown' $status
+	 * @return array{ok:bool,open:bool,status:'open'|'closed'|'unknown',error:string}
+	 */
+	private function txn_inspect_state(string $status, string $error = ''): array
+	{
 		return array(
-			'ok'    => false,
-			'open'  => false,
-			'error' => $detail !== '' ? $unknown . ' ' . $detail : $unknown,
+			'ok'     => $status !== 'unknown',
+			'open'   => $status === 'open',
+			'status' => $status,
+			'error'  => $error,
 		);
 	}
 
@@ -378,95 +467,111 @@ final class TPFWLI_Stock_Service
 	}
 
 	/**
-	 * @return array{ok:bool,error:string}
+	 * @return array{ok:bool,accepted:bool,error:string,connection_unsafe:bool,still_open:bool,status:string}
 	 */
 	private function begin_sql_transaction(): array
 	{
 		$run = $this->run_sql_transaction_command('START TRANSACTION');
 		if (!$run['ok']) {
 			return array(
-				'ok'    => false,
-				'error' => $run['error'] !== ''
+				'ok'                => false,
+				'accepted'          => false,
+				'connection_unsafe' => false,
+				'still_open'        => false,
+				'status'            => 'closed',
+				'error'             => $run['error'] !== ''
 					? $run['error']
 					: __('Could not start a database transaction for stock reduction.', 'tickets-passes-legacy-importer'),
 			);
 		}
+
 		$state = $this->inspect_sql_transaction();
-		if (!$state['ok']) {
-			$this->rollback_sql_transaction();
+		if (($state['status'] ?? '') === 'open') {
 			return array(
-				'ok'    => false,
-				'error' => __('Started stock reduction but could not verify that a database transaction is open.', 'tickets-passes-legacy-importer'),
+				'ok'                => true,
+				'accepted'          => true,
+				'connection_unsafe' => false,
+				'still_open'        => true,
+				'status'            => 'open',
+				'error'             => '',
 			);
 		}
-		if (!$state['open']) {
-			return array(
-				'ok'    => false,
-				'error' => __('START TRANSACTION did not open a database transaction. Stock was not changed.', 'tickets-passes-legacy-importer'),
-			);
+
+		$rolled = $this->rollback_sql_transaction();
+		$unsafe = !$rolled['ok'];
+		$error  = ($state['status'] ?? '') === 'unknown'
+			? __('Started stock reduction but could not verify that a database transaction is open.', 'tickets-passes-legacy-importer')
+			: __('START TRANSACTION did not open a database transaction. Stock was not changed.', 'tickets-passes-legacy-importer');
+		if ($unsafe && ($rolled['error'] ?? '') !== '') {
+			$error .= ' ' . $rolled['error'];
 		}
-		return array('ok' => true, 'error' => '');
+		return array(
+			'ok'                => false,
+			'accepted'          => true,
+			'connection_unsafe' => $unsafe,
+			'still_open'        => !empty($rolled['still_open']),
+			'status'            => $rolled['status'] ?? ($unsafe ? 'unknown' : 'closed'),
+			'error'             => $error,
+		);
 	}
 
 	/**
-	 * @return array{ok:bool,error:string,still_open:bool}
+	 * @return array{ok:bool,error:string,still_open:bool,status:string}
 	 */
 	private function commit_sql_transaction(): array
 	{
 		$run   = $this->run_sql_transaction_command('COMMIT');
 		$state = $this->inspect_sql_transaction();
-		if ($run['ok'] && $state['ok'] && !$state['open']) {
-			return array('ok' => true, 'error' => '', 'still_open' => false);
+		if ($run['ok'] && ($state['status'] ?? '') === 'closed') {
+			return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
 		}
 
 		$rolled = $this->rollback_sql_transaction();
+		$status = $rolled['status'] ?? 'unknown';
 		if (!$run['ok']) {
 			return array(
 				'ok'         => false,
-				'still_open' => $rolled['still_open'],
+				'still_open' => !empty($rolled['still_open']),
+				'status'     => $status,
 				'error'      => $run['error'] !== ''
 					? $run['error']
 					: __('COMMIT failed. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'),
 			);
 		}
-		if (!$state['ok']) {
+		if (($state['status'] ?? '') === 'unknown') {
 			return array(
 				'ok'         => false,
-				'still_open' => $rolled['still_open'],
+				'still_open' => !empty($rolled['still_open']) || $status === 'unknown',
+				'status'     => $status,
 				'error'      => __('Stock reduction commit outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer'),
 			);
 		}
 		return array(
 			'ok'         => false,
-			'still_open' => $rolled['still_open'],
+			'still_open' => !empty($rolled['still_open']),
+			'status'     => $status,
 			'error'      => __('COMMIT did not close the database transaction. Stock reduction was not accepted.', 'tickets-passes-legacy-importer'),
 		);
 	}
 
 	/**
-	 * @return array{ok:bool,error:string,still_open:bool}
+	 * @return array{ok:bool,error:string,still_open:bool,status:string}
 	 */
 	private function rollback_sql_transaction(): array
 	{
 		$last_error = '';
 		for ($attempt = 0; $attempt < 2; $attempt++) {
-			$run       = $this->run_sql_transaction_command('ROLLBACK');
+			$run        = $this->run_sql_transaction_command('ROLLBACK');
 			$last_error = $run['error'];
-			$state     = $this->inspect_sql_transaction();
-			if ($run['ok'] && $state['ok'] && !$state['open']) {
-				return array('ok' => true, 'error' => '', 'still_open' => false);
+			$state      = $this->inspect_sql_transaction();
+			if (($state['status'] ?? '') === 'closed') {
+				return array('ok' => true, 'error' => '', 'still_open' => false, 'status' => 'closed');
 			}
-			if ($state['ok'] && !$state['open']) {
-				return array(
-					'ok'         => true,
-					'error'      => '',
-					'still_open' => false,
-				);
-			}
-			if (!$state['ok']) {
+			if (($state['status'] ?? '') === 'unknown') {
 				return array(
 					'ok'         => false,
 					'still_open' => true,
+					'status'     => 'unknown',
 					'error'      => __('Stock reduction was interrupted and the rollback outcome is uncertain. Tickets and email were not sent.', 'tickets-passes-legacy-importer'),
 				);
 			}
@@ -474,10 +579,28 @@ final class TPFWLI_Stock_Service
 		return array(
 			'ok'         => false,
 			'still_open' => true,
+			'status'     => 'open',
 			'error'      => $last_error !== ''
 				? $last_error
 				: __('ROLLBACK failed and a database transaction may still be open. Tickets and email were not sent.', 'tickets-passes-legacy-importer'),
 		);
+	}
+
+	/**
+	 * @param callable $fail
+	 * @param array<string,mixed> $cleanup
+	 * @return array{ok:bool,error:string,current_stock:?int,reduced_qty:int,connection_unsafe:bool,original_error:string,cleanup_error:string,txn_status:string}
+	 */
+	private function fail_fatal(string $original, array $cleanup, callable $fail): array
+	{
+		$cleanup_error = (string) ($cleanup['error'] ?? '');
+		$message       = trim($original . ($cleanup_error !== '' && $cleanup_error !== $original ? ' ' . $cleanup_error : ''));
+		$out           = $fail($message !== '' ? $message : $original);
+		$out['connection_unsafe'] = true;
+		$out['original_error']    = $original;
+		$out['cleanup_error']     = $cleanup_error;
+		$out['txn_status']        = (string) ($cleanup['status'] ?? (!empty($cleanup['still_open']) ? 'open' : 'unknown'));
+		return $out;
 	}
 
 	/**
@@ -577,33 +700,24 @@ final class TPFWLI_Stock_Service
 		}
 
 		$item_ids = $this->order_item_ids($order_id);
-		$item_keys = array();
 		foreach ($item_ids as $item_id) {
-			$item_keys[] = 'item-' . $item_id;
-			$item_keys[] = (string) $item_id;
-			$item_keys[] = 'order-item-meta-' . $item_id;
 			wp_cache_delete('item-' . $item_id, 'order-items');
-			wp_cache_delete($item_id, 'order-items');
 			wp_cache_delete($item_id, 'order_item_meta');
-			wp_cache_delete($item_id, 'item_meta');
-			wp_cache_delete('order-item-meta-' . $item_id, 'order-items');
+			if (method_exists('WC_Data', 'generate_meta_cache_key')) {
+				$key = WC_Data::generate_meta_cache_key($item_id, 'order-items');
+				if (is_string($key) && $key !== '') {
+					wp_cache_delete($key, 'order-items');
+				}
+			}
+			if (class_exists('WC_Cache_Helper') && method_exists('WC_Cache_Helper', 'invalidate_cache_group')) {
+				WC_Cache_Helper::invalidate_cache_group('object_' . $item_id);
+			}
 		}
 		wp_cache_delete('order-items-' . $order_id, 'orders');
 		wp_cache_delete($order_id, 'orders');
 		wp_cache_delete('order-' . $order_id, 'orders');
 		wp_cache_delete($order_id, 'posts');
 		wp_cache_delete($order_id, 'post_meta');
-		if (class_exists('WC_Cache_Helper') && method_exists('WC_Cache_Helper', 'get_cache_prefix')) {
-			$order_prefix = (string) WC_Cache_Helper::get_cache_prefix('orders');
-			wp_cache_delete($order_prefix . $order_id, 'orders');
-			wp_cache_delete($order_prefix . 'order_' . $order_id, 'orders');
-			wp_cache_delete($order_prefix . 'order-items-' . $order_id, 'orders');
-			$item_prefix = (string) WC_Cache_Helper::get_cache_prefix('order-items');
-			foreach ($item_keys as $item_key) {
-				wp_cache_delete($item_prefix . $item_key, 'order-items');
-				wp_cache_delete($item_prefix . $item_key, 'order_item_meta');
-			}
-		}
 		clean_post_cache($order_id);
 		if (function_exists('wc_delete_shop_order_transients')) {
 			wc_delete_shop_order_transients($order_id);

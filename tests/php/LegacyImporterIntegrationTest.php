@@ -60,6 +60,9 @@ final class LegacyImporterIntegrationTest extends TestCase
 
 	protected function setUp(): void
 	{
+		if (class_exists('TPFWLI_Database_Session')) {
+			TPFWLI_Database_Session::reset_for_tests();
+		}
 		self::$mail = array();
 		self::$mail_fail = false;
 		wp_set_current_user(self::$admin_id);
@@ -768,6 +771,239 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
 	}
 
+	public function test_start_then_inspect_closed_is_rolled_back(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'txn-start-closed@example.com',
+			'first_name' => 'TxnStartClosed',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$filter = $this->forceTxnInspectAfterFirst('closed');
+		$GLOBALS['wpdb']->suppress_errors(true);
+		try {
+			$result = (new TPFWLI_Stock_Service())->reduce_if_needed($order, wc_get_product(self::$ticket_id), 2);
+		} finally {
+			remove_filter('query', $filter, 999);
+			$GLOBALS['wpdb']->suppress_errors(false);
+		}
+		$this->assertFalse($result['ok']);
+		$this->assertSame('0', $this->sessionInTransaction());
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+	}
+
+	public function test_start_then_inspect_unknown_is_rolled_back(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'txn-start-unknown@example.com',
+			'first_name' => 'TxnStartUnknown',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$filter = $this->forceTxnInspectAfterFirst('unknown');
+		$GLOBALS['wpdb']->suppress_errors(true);
+		try {
+			$result = (new TPFWLI_Stock_Service())->reduce_if_needed($order, wc_get_product(self::$ticket_id), 2);
+		} finally {
+			remove_filter('query', $filter, 999);
+			$GLOBALS['wpdb']->suppress_errors(false);
+		}
+		$this->assertFalse($result['ok']);
+		$this->assertSame('0', $this->sessionInTransaction());
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+	}
+
+	public function test_unconfirmed_rollback_does_not_write_follow_up_state(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'txn-fatal-rollback@example.com',
+			'first_name' => 'TxnFatalRb',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$order_id = (int) $order->get_id();
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$other = $this->secondDb();
+		$notes_before = $this->count_order_notes_other($other, $order_id);
+		$writes = array();
+		$after_crash = false;
+		$filter = $this->failSqlCommands(array('ROLLBACK'));
+		$spy = static function ($sql) use (&$writes, &$after_crash) {
+			if ($after_crash && is_string($sql) && preg_match('/^\s*(INSERT|UPDATE|REPLACE|DELETE)/i', $sql)) {
+				$writes[] = $sql;
+			}
+			return $sql;
+		};
+		$crash = static function (string $point) use (&$after_crash): void {
+			if ($point === 'after_product_stock') {
+				$after_crash = true;
+				throw new RuntimeException('stock-checkpoint:after_product_stock');
+			}
+		};
+		add_filter('query', $spy, 1000);
+		add_action('tpfwli_stock_checkpoint', $crash, 10, 1);
+		$GLOBALS['wpdb']->suppress_errors(true);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $crash, 10);
+			remove_filter('query', $spy, 1000);
+			remove_filter('query', $filter, 999);
+			$GLOBALS['wpdb']->suppress_errors(false);
+		}
+		$this->assertFalse($result['ok']);
+		$this->assertTrue(!empty($result['errors']));
+		$this->assertTrue(
+			(bool) preg_match('/stock-checkpoint:after_product_stock|ROLLBACK|uncertain|isolated/i', implode(' ', $result['errors']))
+		);
+		$this->assertTrue(TPFWLI_Database_Session::is_quarantined());
+		$follow_up = array_values(array_filter($writes, static function ($sql) {
+			return str_contains($sql, '_tpfwli_stock_stage')
+				|| str_contains($sql, '_tpfwli_issue_stage')
+				|| str_contains($sql, '_tpfwli_email_stage')
+				|| str_contains($sql, 'comment_content')
+				|| str_contains($sql, 'wp_comments');
+		}));
+		$this->assertSame(array(), $follow_up, implode("\n", $follow_up));
+		$this->assertSame($start_stock, (int) $other->get_var($other->prepare(
+			"SELECT meta_value FROM {$other->postmeta} WHERE post_id = %d AND meta_key = %s",
+			self::$ticket_id,
+			'_stock'
+		)));
+		$this->assertNotSame('failed', $this->db_stock_stage_other($other, $order_id));
+		$this->assertSame($notes_before, $this->count_order_notes_other($other, $order_id));
+		$this->assertSame(0, (int) $other->get_var($other->prepare(
+			'SELECT COUNT(*) FROM `' . $other->prefix . 'tpfw_tickets` WHERE order_id = %d AND deleted IS NULL',
+			$order_id
+		)));
+		TPFWLI_Database_Session::reset_for_tests();
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_wc_order_item_raw_meta_cache_is_cleared_after_rollback(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-wc-item-cache@example.com',
+			'first_name' => 'StockWcItemCache',
+			'quantity'   => '2',
+		));
+		$order = $this->readyOrderForStock($input);
+		$order_id = (int) $order->get_id();
+		$item_id = (int) array_values($order->get_items('line_item'))[0]->get_id();
+		$start_stock = $this->db_product_stock(self::$ticket_id);
+		$this->assertTrue(method_exists('WC_Data', 'generate_meta_cache_key'));
+		$crash = static function (string $point) use ($item_id): void {
+			if ($point !== 'after_line_meta') {
+				return;
+			}
+			$warm = new WC_Order_Item_Product($item_id);
+			$warm->get_meta('_reduced_stock', true);
+			throw new RuntimeException('stock-checkpoint:after_line_meta');
+		};
+		add_action('tpfwli_stock_checkpoint', $crash, 10, 1);
+		try {
+			$result = (new TPFWLI_Stock_Service())->reduce_if_needed($order, wc_get_product(self::$ticket_id), 2);
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $crash, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$this->assertNull($this->db_line_reduced_stock($order_id));
+		$probe = new WC_Order_Item_Product($item_id);
+		$this->assertFalse($probe->meta_exists('_reduced_stock'));
+		$this->assertSame('', (string) $probe->get_meta('_reduced_stock', true));
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock($order_id));
+		if (wp_using_ext_object_cache()) {
+			$key = WC_Data::generate_meta_cache_key($item_id, 'order-items');
+			$cached = wp_cache_get($key, 'order-items');
+			$this->assertTrue($cached === false || $cached === null || empty($cached['_reduced_stock']));
+		}
+	}
+
+	public function test_mysql_transaction_inspect_is_safe_immediately_after_start(): void
+	{
+		$mysql = $this->isolatedMysql();
+		if (!$mysql instanceof wpdb) {
+			$this->markTestSkipped('Isolated MySQL is not available on 127.0.0.1:3307');
+		}
+		$previous = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = $mysql;
+		$mysql->suppress_errors(true);
+		try {
+			$service = new TPFWLI_Stock_Service();
+			$inspect = $this->callStockPrivate($service, 'inspect_sql_transaction');
+			$this->assertSame('closed', $inspect['status'], wp_json_encode($inspect));
+
+			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
+			$this->assertTrue($started['ok'], $started['error'] ?? '');
+			$after_start = $this->callStockPrivate($service, 'inspect_sql_transaction');
+			$this->assertSame('open', $after_start['status'], wp_json_encode($after_start));
+
+			$trx = $mysql->get_var('SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()');
+			$this->assertTrue(is_numeric($trx));
+
+			$committed = $this->callStockPrivate($service, 'commit_sql_transaction');
+			$this->assertTrue($committed['ok'], $committed['error'] ?? '');
+			$after_commit = $this->callStockPrivate($service, 'inspect_sql_transaction');
+			$this->assertSame('closed', $after_commit['status'], wp_json_encode($after_commit));
+
+			$started = $this->callStockPrivate($service, 'begin_sql_transaction');
+			$this->assertTrue($started['ok'], $started['error'] ?? '');
+			$rolled = $this->callStockPrivate($service, 'rollback_sql_transaction');
+			$this->assertTrue($rolled['ok'], $rolled['error'] ?? '');
+			$after_rollback = $this->callStockPrivate($service, 'inspect_sql_transaction');
+			$this->assertSame('closed', $after_rollback['status'], wp_json_encode($after_rollback));
+		} finally {
+			$mysql->query('ROLLBACK');
+			$mysql->suppress_errors(false);
+			$GLOBALS['wpdb'] = $previous;
+			TPFWLI_Database_Session::reset_for_tests();
+		}
+	}
+
+	public function test_mysql_empty_innodb_trx_is_not_treated_as_closed(): void
+	{
+		$mysql = $this->isolatedMysql();
+		if (!$mysql instanceof wpdb) {
+			$this->markTestSkipped('Isolated MySQL is not available on 127.0.0.1:3307');
+		}
+		$previous = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = $mysql;
+		$filter = static function ($sql) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			if (str_contains($sql, 'in_transaction') || str_contains($sql, 'events_transactions_current')) {
+				return 'SELECT tpfwli_missing_txn_state FROM dual';
+			}
+			return $sql;
+		};
+		add_filter('query', $filter, 999);
+		$mysql->suppress_errors(true);
+		try {
+			$mysql->query('START TRANSACTION');
+			$inspect = $this->callStockPrivate(new TPFWLI_Stock_Service(), 'inspect_sql_transaction');
+			$trx = $mysql->get_var('SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()');
+			$this->assertSame('0', (string) $trx);
+			$this->assertSame('unknown', $inspect['status'], wp_json_encode($inspect));
+			$this->assertFalse($inspect['ok']);
+		} finally {
+			remove_filter('query', $filter, 999);
+			$mysql->query('ROLLBACK');
+			$mysql->suppress_errors(false);
+			$GLOBALS['wpdb'] = $previous;
+			TPFWLI_Database_Session::reset_for_tests();
+		}
+	}
+
 	public function test_wc_use_transactions_false_still_rolls_back_in_a_separate_process(): void
 	{
 		if (!function_exists('proc_open')) {
@@ -842,7 +1078,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 			if (!is_string($sql)) {
 				return $sql;
 			}
-			if (str_contains($sql, 'in_transaction') || str_contains($sql, 'INNODB_TRX')) {
+			if (str_contains($sql, 'in_transaction') || str_contains($sql, 'INNODB_TRX') || str_contains($sql, 'events_transactions_current')) {
 				return 'SELECT tpfwli_missing_txn_state FROM dual';
 			}
 			return $sql;
@@ -2343,6 +2579,88 @@ final class LegacyImporterIntegrationTest extends TestCase
 	{
 		global $wpdb;
 		return (string) $wpdb->get_var('SELECT @@SESSION.in_transaction');
+	}
+
+	private function forceTxnInspectAfterFirst(string $mode): callable
+	{
+		$seen = 0;
+		$filter = static function ($sql) use ($mode, &$seen) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			if (
+				!str_contains($sql, 'in_transaction')
+				&& !str_contains($sql, 'INNODB_TRX')
+				&& !str_contains($sql, 'events_transactions_current')
+			) {
+				return $sql;
+			}
+			$seen++;
+			if ($seen <= 1) {
+				return $sql;
+			}
+			return $mode === 'closed'
+				? 'SELECT 0'
+				: 'SELECT tpfwli_missing_txn_state FROM dual';
+		};
+		add_filter('query', $filter, 999);
+		return $filter;
+	}
+
+	private function secondDb(): wpdb
+	{
+		global $wpdb;
+		$other = new wpdb(DB_USER, DB_PASSWORD, DB_NAME, DB_HOST);
+		$this->assertInstanceOf(wpdb::class, $other);
+		$other->set_prefix($wpdb->prefix);
+		return $other;
+	}
+
+	private function count_order_notes(int $order_id): int
+	{
+		return count(wc_get_order_notes(array('order_id' => $order_id)));
+	}
+
+	private function count_order_notes_other(wpdb $db, int $order_id): int
+	{
+		return (int) $db->get_var($db->prepare(
+			"SELECT COUNT(*) FROM {$db->comments} WHERE comment_post_ID = %d AND comment_type = %s",
+			$order_id,
+			'order_note'
+		));
+	}
+
+	private function db_stock_stage_other(wpdb $db, int $order_id): string
+	{
+		$table = $db->prefix . 'wc_orders_meta';
+		$value = $db->get_var($db->prepare(
+			"SELECT meta_value FROM {$table} WHERE order_id = %d AND meta_key = %s",
+			$order_id,
+			TPFWLI_Plugin::META_STOCK_STAGE
+		));
+		return (string) $value;
+	}
+
+	/**
+	 * @return mixed
+	 */
+	private function callStockPrivate(TPFWLI_Stock_Service $service, string $method, array $args = array())
+	{
+		return (new ReflectionMethod($service, $method))->invokeArgs($service, $args);
+	}
+
+	private function isolatedMysql(): ?wpdb
+	{
+		$host = getenv('TPFWLI_MYSQL_HOST') ?: '127.0.0.1';
+		$port = getenv('TPFWLI_MYSQL_PORT') ?: '3307';
+		$user = getenv('TPFWLI_MYSQL_USER') ?: 'root';
+		$pass = getenv('TPFWLI_MYSQL_PASSWORD') ?: 'tpfwli';
+		$name = getenv('TPFWLI_MYSQL_DATABASE') ?: 'tpfwli_txn';
+		$db   = @new wpdb($user, $pass, $name, $host . ':' . $port);
+		if (!empty($db->error) || !$db->ready) {
+			return null;
+		}
+		return $db;
 	}
 
 	/**

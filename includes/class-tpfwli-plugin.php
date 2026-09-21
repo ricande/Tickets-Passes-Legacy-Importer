@@ -48,6 +48,7 @@ final class TPFWLI_Plugin
 
 		foreach (array(
 			'class-tpfwli-dependencies.php',
+			'class-tpfwli-database-session.php',
 			'class-tpfwli-import-lock.php',
 			'class-tpfwli-import-repository.php',
 			'class-tpfwli-input-validator.php',

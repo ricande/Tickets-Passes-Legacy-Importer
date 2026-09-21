@@ -191,6 +191,7 @@ final class TPFWLI_Order_Service
 
 	public function set_stage(WC_Order $order, string $meta_key, string $value, string $note = ''): void
 	{
+		TPFWLI_Database_Session::assert_writable();
 		$order->update_meta_data($meta_key, $value);
 		if ($note !== '') {
 			$order->add_order_note($note);

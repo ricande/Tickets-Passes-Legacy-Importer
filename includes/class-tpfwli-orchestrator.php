@@ -256,7 +256,22 @@ final class TPFWLI_Orchestrator
 	private function ensure_stock(WC_Order $order, WC_Product $product, int $quantity): array
 	{
 		$result = $this->stock->reduce_if_needed($order, $product, $quantity);
-		$order  = wc_get_order($order->get_id());
+		if (!empty($result['connection_unsafe'])) {
+			TPFWLI_Database_Session::quarantine(
+				$result['error'] !== ''
+					? $result['error']
+					: __('Stock rollback could not be confirmed. The database session was isolated.', 'tickets-passes-legacy-importer')
+			);
+			$errors = array($result['error']);
+			if (!empty($result['original_error']) && !in_array($result['original_error'], $errors, true)) {
+				array_unshift($errors, $result['original_error']);
+			}
+			if (!empty($result['cleanup_error']) && !in_array($result['cleanup_error'], $errors, true)) {
+				$errors[] = $result['cleanup_error'];
+			}
+			return $this->result(false, array_values(array_filter($errors)), $order, array(), $result['current_stock'] ?? null);
+		}
+		$order = wc_get_order($order->get_id());
 		if (!$result['ok']) {
 			$this->orders->set_stage(
 				$order,
