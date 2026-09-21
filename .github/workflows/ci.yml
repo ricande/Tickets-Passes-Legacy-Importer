@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  qualify:
+    name: Lint, suite and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      mariadb:
+        image: mariadb:10.11.14
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wordpress
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      TPFWLI_WP_PATH: /tmp/tpfwli-wp
+      TPFWLI_DB_NAME: wordpress
+      TPFWLI_DB_USER: root
+      TPFWLI_DB_PASSWORD: root
+      TPFWLI_DB_HOST: 127.0.0.1:3306
+      TPFWLI_MYSQL_HOST: 127.0.0.1
+      TPFWLI_MYSQL_PORT: '3306'
+      TPFWLI_MYSQL_USER: root
+      TPFWLI_MYSQL_PASSWORD: root
+      TPFWLI_MYSQL_DATABASE: tpfwli_txn
+    steps:
+      - name: Checkout importer
+        uses: actions/checkout@v4
+
+      - name: PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mysqli, mysqlnd, mbstring, xml, zip, gd, intl, curl
+          coverage: none
+          ini-values: memory_limit=512M
+
+      - name: WP-CLI 2.11.0
+        run: |
+          curl -fsSL --retry 3 -o /tmp/wp-cli.phar \
+            https://github.com/wp-cli/wp-cli/releases/download/v2.11.0/wp-cli-2.11.0.phar
+          php /tmp/wp-cli.phar --info >/dev/null
+          sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
+
+      - name: Isolated transaction database
+        run: |
+          php -r '
+          $db = new mysqli("127.0.0.1", "root", "root");
+          if ($db->connect_error) { fwrite(STDERR, $db->connect_error); exit(1); }
+          if (!$db->query("CREATE DATABASE IF NOT EXISTS tpfwli_txn")) { fwrite(STDERR, $db->error); exit(1); }
+          '
+
+      - name: Provision WordPress, WooCommerce HPOS and pinned TPFW
+        run: bash scripts/ci-provision-wordpress.sh
+
+      - name: PHP lint
+        run: bash scripts/php-lint.sh
+
+      - name: PHPUnit
+        run: bash tests/run.sh
+
+      - name: Package contract
+        run: bash scripts/package-contract.sh
