@@ -37,6 +37,9 @@ $out = array(
 );
 
 try {
+	$mysql->query('START TRANSACTION');
+	$mysql->query('SELECT 1');
+	$mysql->query('COMMIT');
 	$out['before'] = $call('inspect_sql_transaction');
 	$mysql->query('START TRANSACTION');
 	$out['after_start_before_innodb'] = array(

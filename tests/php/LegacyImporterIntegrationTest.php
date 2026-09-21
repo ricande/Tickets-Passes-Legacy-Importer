@@ -939,6 +939,9 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$mysql->suppress_errors(true);
 		try {
 			$service = new TPFWLI_Stock_Service();
+			$mysql->query('START TRANSACTION');
+			$mysql->query('SELECT 1');
+			$mysql->query('COMMIT');
 			$inspect = $this->callStockPrivate($service, 'inspect_sql_transaction');
 			$this->assertSame('closed', $inspect['status'], wp_json_encode($inspect));
 
@@ -1001,6 +1004,32 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$mysql->suppress_errors(false);
 			$GLOBALS['wpdb'] = $previous;
 			TPFWLI_Database_Session::reset_for_tests();
+		}
+	}
+
+	public function test_mysql_incomplete_ps_does_not_close_or_commit_an_outer_transaction(): void
+	{
+		$admin = $this->isolatedMysql();
+		if (!$admin instanceof wpdb) {
+			$this->markTestSkipped('Isolated MySQL is not available on 127.0.0.1:3307');
+		}
+		$saved = $this->mysqlPsSnapshot($admin);
+		$admin->query('CREATE TABLE IF NOT EXISTS tpfwli_ps_probe (id INT PRIMARY KEY, note VARCHAR(64)) ENGINE=InnoDB');
+		$modes = array(
+			'instrument_off',
+			'thread_not_instrumented',
+			'thread_instrumentation_off',
+		);
+		$id = 1;
+		try {
+			foreach ($modes as $mode) {
+				foreach (array('no_event', 'stale_then_new') as $scenario) {
+					$this->assertMysqlIncompletePsLeavesOuterTransaction($admin, $mode, $scenario, $id);
+					$id++;
+				}
+			}
+		} finally {
+			$this->mysqlPsRestore($admin, $saved);
 		}
 	}
 
@@ -2661,6 +2690,104 @@ final class LegacyImporterIntegrationTest extends TestCase
 			return null;
 		}
 		return $db;
+	}
+
+	/**
+	 * @return array<string,string>
+	 */
+	private function mysqlPsSnapshot(wpdb $admin): array
+	{
+		return array(
+			'instrument' => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_instruments WHERE NAME = 'transaction'"),
+			'global'     => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'global_instrumentation'"),
+			'thread'     => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'thread_instrumentation'"),
+			'current'    => (string) $admin->get_var("SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_transactions_current'"),
+		);
+	}
+
+	/**
+	 * @param array<string,string> $saved
+	 */
+	private function mysqlPsRestore(wpdb $admin, array $saved): void
+	{
+		$admin->query($admin->prepare("UPDATE performance_schema.setup_instruments SET ENABLED = %s WHERE NAME = 'transaction'", $saved['instrument'] !== '' ? $saved['instrument'] : 'YES'));
+		$admin->query($admin->prepare("UPDATE performance_schema.setup_consumers SET ENABLED = %s WHERE NAME = 'global_instrumentation'", $saved['global'] !== '' ? $saved['global'] : 'YES'));
+		$admin->query($admin->prepare("UPDATE performance_schema.setup_consumers SET ENABLED = %s WHERE NAME = 'thread_instrumentation'", $saved['thread'] !== '' ? $saved['thread'] : 'YES'));
+		$admin->query($admin->prepare("UPDATE performance_schema.setup_consumers SET ENABLED = %s WHERE NAME = 'events_transactions_current'", $saved['current'] !== '' ? $saved['current'] : 'YES'));
+	}
+
+	private function mysqlPsEnableFull(wpdb $admin): void
+	{
+		$admin->query("UPDATE performance_schema.setup_instruments SET ENABLED = 'YES' WHERE NAME = 'transaction'");
+		$admin->query("UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME IN ('global_instrumentation', 'thread_instrumentation', 'events_transactions_current')");
+	}
+
+	private function mysqlPsDisable(string $mode, wpdb $admin, wpdb $conn): void
+	{
+		if ($mode === 'instrument_off') {
+			$admin->query("UPDATE performance_schema.setup_instruments SET ENABLED = 'NO' WHERE NAME = 'transaction'");
+			return;
+		}
+		if ($mode === 'thread_not_instrumented') {
+			$conn->query("UPDATE performance_schema.threads SET INSTRUMENTED = 'NO' WHERE PROCESSLIST_ID = CONNECTION_ID()");
+			return;
+		}
+		$admin->query("UPDATE performance_schema.setup_consumers SET ENABLED = 'NO' WHERE NAME = 'thread_instrumentation'");
+	}
+
+	private function assertMysqlIncompletePsLeavesOuterTransaction(wpdb $admin, string $mode, string $scenario, int $probe_id): void
+	{
+		$this->mysqlPsEnableFull($admin);
+		$conn = $this->isolatedMysql();
+		$other = $this->isolatedMysql();
+		$this->assertInstanceOf(wpdb::class, $conn);
+		$this->assertInstanceOf(wpdb::class, $other);
+		$admin->query($admin->prepare('DELETE FROM tpfwli_ps_probe WHERE id = %d', $probe_id));
+		$conn->suppress_errors(true);
+		$previous = $GLOBALS['wpdb'];
+		$GLOBALS['wpdb'] = $conn;
+		try {
+			if ($scenario === 'stale_then_new') {
+				$conn->query('START TRANSACTION');
+				$conn->query('SELECT 1');
+				$conn->query('COMMIT');
+				$stale = $conn->get_var(
+					"SELECT STATE FROM performance_schema.events_transactions_current
+					WHERE THREAD_ID = (SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = CONNECTION_ID())"
+				);
+				$this->assertSame('COMMITTED', strtoupper((string) $stale), $mode . ' ' . $scenario);
+			}
+			$this->mysqlPsDisable($mode, $admin, $conn);
+			$conn->query('START TRANSACTION');
+			$conn->query($conn->prepare(
+				'INSERT INTO tpfwli_ps_probe (id, note) VALUES (%d, %s)',
+				$probe_id,
+				$mode . ':' . $scenario
+			));
+			$this->assertSame(1, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+
+			$inspect = $this->callStockPrivate(new TPFWLI_Stock_Service(), 'inspect_sql_transaction');
+			$this->assertNotSame('closed', $inspect['status'], $mode . ' ' . $scenario . ' ' . wp_json_encode($inspect));
+			$this->assertContains($inspect['status'], array('unknown', 'open'), $mode . ' ' . $scenario . ' ' . wp_json_encode($inspect));
+			if ($inspect['status'] === 'unknown') {
+				$this->assertFalse($inspect['ok']);
+				$this->assertFalse($inspect['open']);
+			} else {
+				$this->assertTrue($inspect['ok']);
+				$this->assertTrue($inspect['open']);
+			}
+
+			// Stock step must refuse without START/COMMIT/ROLLBACK when state is unknown.
+			$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+			$this->assertSame(1, (int) $conn->get_var($conn->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
+		} finally {
+			$conn->query('ROLLBACK');
+			$conn->query("UPDATE performance_schema.threads SET INSTRUMENTED = 'YES' WHERE PROCESSLIST_ID = CONNECTION_ID()");
+			$GLOBALS['wpdb'] = $previous;
+			$this->mysqlPsEnableFull($admin);
+			TPFWLI_Database_Session::reset_for_tests();
+		}
+		$this->assertSame(0, (int) $other->get_var($other->prepare('SELECT COUNT(*) FROM tpfwli_ps_probe WHERE id = %d', $probe_id)));
 	}
 
 	/**

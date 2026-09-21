@@ -358,26 +358,9 @@ final class TPFWLI_Stock_Service
 			return $this->txn_inspect_state($this->flag_is_true($session['value']) ? 'open' : 'closed');
 		}
 
-		if ($this->performance_schema_transactions_enabled()) {
-			$ps = $this->sql_optional_scalar(
-				'SELECT STATE FROM performance_schema.events_transactions_current
-				WHERE THREAD_ID = (
-					SELECT THREAD_ID FROM performance_schema.threads
-					WHERE PROCESSLIST_ID = CONNECTION_ID()
-				)'
-			);
-			if ($ps['ok']) {
-				$state = strtoupper(trim((string) $ps['value']));
-				if ($state === '') {
-					return $this->txn_inspect_state('closed');
-				}
-				if ($state === 'ACTIVE') {
-					return $this->txn_inspect_state('open');
-				}
-				if (in_array($state, array('COMMITTED', 'ROLLED BACK'), true)) {
-					return $this->txn_inspect_state('closed');
-				}
-			}
+		$ps = $this->inspect_performance_schema_transaction();
+		if ($ps['status'] === 'open' || $ps['status'] === 'closed') {
+			return $ps;
 		}
 
 		$trx = $this->sql_optional_scalar('SELECT COUNT(*) FROM information_schema.INNODB_TRX WHERE trx_mysql_thread_id = CONNECTION_ID()');
@@ -385,16 +368,84 @@ final class TPFWLI_Stock_Service
 			return $this->txn_inspect_state('open');
 		}
 
-		$detail = $session['error'] !== '';
-		return $this->txn_inspect_state('unknown', $detail ? $unknown . ' ' . $session['error'] : $unknown);
+		$detail = $ps['error'] !== '' ? $ps['error'] : (string) $session['error'];
+		return $this->txn_inspect_state('unknown', $detail !== '' ? $unknown . ' ' . $detail : $unknown);
 	}
 
-	private function performance_schema_transactions_enabled(): bool
+	/**
+	 * Performance Schema is evidence only when this session's transactions are collected.
+	 *
+	 * @return array{ok:bool,open:bool,status:'open'|'closed'|'unknown',error:string}
+	 */
+	private function inspect_performance_schema_transaction(): array
 	{
-		$enabled = $this->sql_optional_scalar(
-			"SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_transactions_current'"
+		$row = $this->sql_optional_row(
+			"SELECT
+				(SELECT ENABLED FROM performance_schema.setup_instruments WHERE NAME = 'transaction') AS instrument_enabled,
+				(SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'global_instrumentation') AS global_consumer,
+				(SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'thread_instrumentation') AS thread_consumer,
+				(SELECT ENABLED FROM performance_schema.setup_consumers WHERE NAME = 'events_transactions_current') AS current_consumer,
+				t.THREAD_ID AS thread_id,
+				t.INSTRUMENTED AS thread_instrumented,
+				e.STATE AS event_state
+			FROM performance_schema.threads t
+			LEFT JOIN performance_schema.events_transactions_current e ON e.THREAD_ID = t.THREAD_ID
+			WHERE t.PROCESSLIST_ID = CONNECTION_ID()"
 		);
-		return $enabled['ok'] && strtoupper((string) $enabled['value']) === 'YES';
+		if (!$row['ok']) {
+			return $this->txn_inspect_state('unknown', $row['error']);
+		}
+		if (!is_array($row['value'])) {
+			return $this->txn_inspect_state('unknown', '');
+		}
+
+		$data = $row['value'];
+		if (!$this->ps_flag_yes($data['instrument_enabled'] ?? null)
+			|| !$this->ps_flag_yes($data['global_consumer'] ?? null)
+			|| !$this->ps_flag_yes($data['thread_consumer'] ?? null)
+			|| !$this->ps_flag_yes($data['current_consumer'] ?? null)
+			|| !$this->ps_flag_yes($data['thread_instrumented'] ?? null)
+			|| ($data['thread_id'] ?? null) === null
+			|| ($data['thread_id'] ?? '') === ''
+		) {
+			return $this->txn_inspect_state('unknown', '');
+		}
+
+		$state = strtoupper(trim((string) ($data['event_state'] ?? '')));
+		if ($state === 'ACTIVE') {
+			return $this->txn_inspect_state('open');
+		}
+		if (in_array($state, array('COMMITTED', 'ROLLED BACK'), true)) {
+			return $this->txn_inspect_state('closed');
+		}
+
+		return $this->txn_inspect_state('unknown', '');
+	}
+
+	private function ps_flag_yes(mixed $value): bool
+	{
+		return strtoupper(trim((string) $value)) === 'YES';
+	}
+
+	/**
+	 * @return array{ok:bool,value:?array<string,mixed>,error:string}
+	 */
+	private function sql_optional_row(string $sql): array
+	{
+		global $wpdb;
+		$previous_suppress = $wpdb->suppress_errors(true);
+		$previous_show     = $wpdb->show_errors(false);
+		try {
+			$value = $wpdb->get_row($sql, ARRAY_A);
+			$error = (string) $wpdb->last_error;
+			if ($error !== '') {
+				return array('ok' => false, 'value' => null, 'error' => $error);
+			}
+			return array('ok' => true, 'value' => is_array($value) ? $value : null, 'error' => '');
+		} finally {
+			$wpdb->suppress_errors((bool) $previous_suppress);
+			$wpdb->show_errors((bool) $previous_show);
+		}
 	}
 
 	/**
