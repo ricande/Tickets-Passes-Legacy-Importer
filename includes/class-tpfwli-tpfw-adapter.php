@@ -238,6 +238,22 @@ final class TPFWLI_Tpfw_Adapter
 		$product_id = (int) $item->get_product_id();
 		$line_id    = (int) $item->get_id();
 		$order_id   = (int) $order->get_id();
+		if ($quantity < 1) {
+			return array(
+				'ok'     => false,
+				'errors' => array(__('The locked import quantity is not valid.', 'tickets-passes-legacy-importer')),
+				'nanos'  => array(),
+				'count'  => 0,
+			);
+		}
+		if ((int) $item->get_quantity() !== $quantity) {
+			$errors[] = sprintf(
+				/* translators: 1: order line quantity, 2: locked quantity */
+				__('Order line quantity is %1$d, expected %2$d.', 'tickets-passes-legacy-importer'),
+				(int) $item->get_quantity(),
+				$quantity
+			);
+		}
 		$expected_product = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_PRODUCT_ID);
 		$expected_max     = (int) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_MAX_USES);
 		$expected_from    = (string) $order->get_meta(TPFWLI_Plugin::META_EXPECTED_VALID_FROM);
@@ -304,24 +320,55 @@ final class TPFWLI_Tpfw_Adapter
 			);
 		}
 
-		if (count($nanos) !== count(array_unique($nanos))) {
+		$unique_nanos = array_values(array_unique($nanos));
+		if (count($unique_nanos) !== count($nanos)) {
 			$errors[] = __('Issued nano IDs are not unique.', 'tickets-passes-legacy-importer');
 		}
 
+		$line_codes = $this->line_ticket_codes($item);
+		$position_codes = array();
 		for ($i = 1; $i <= $quantity; $i++) {
-			$meta_nano = (string) $item->get_meta('tpfw_ticket_id_' . $i, true);
-			if ($meta_nano === '') {
+			if (!isset($line_codes[$i]) || $line_codes[$i] === array()) {
 				$errors[] = sprintf(
 					/* translators: %d: 1-based ticket index */
 					__('Order line is missing tpfw_ticket_id_%d.', 'tickets-passes-legacy-importer'),
 					$i
 				);
-			} elseif (!in_array($meta_nano, $nanos, true)) {
+				continue;
+			}
+			if (count($line_codes[$i]) !== 1 || $line_codes[$i][0] === '') {
 				$errors[] = sprintf(
-					/* translators: %s: nano id */
-					__('Order line nano ID %s does not match a live ticket row.', 'tickets-passes-legacy-importer'),
-					$meta_nano
+					/* translators: %d: 1-based ticket index */
+					__('Order line tpfw_ticket_id_%d is empty or repeated.', 'tickets-passes-legacy-importer'),
+					$i
 				);
+				continue;
+			}
+			$position_codes[] = $line_codes[$i][0];
+		}
+
+		foreach (array_keys($line_codes) as $index) {
+			if ($index < 1 || $index > $quantity) {
+				$errors[] = sprintf(
+					/* translators: %d: unexpected ticket meta index */
+					__('Order line has unexpected tpfw_ticket_id_%d metadata.', 'tickets-passes-legacy-importer'),
+					$index
+				);
+			}
+		}
+
+		$unique_positions = array_values(array_unique($position_codes));
+		if (count($position_codes) !== $quantity || count($unique_positions) !== $quantity) {
+			$errors[] = __('Order line ticket codes are not exactly one unique code per position.', 'tickets-passes-legacy-importer');
+		} elseif (count($unique_nanos) !== $quantity) {
+			$errors[] = __('Live ticket codes are not exactly one unique code per issued ticket.', 'tickets-passes-legacy-importer');
+		} else {
+			$left  = $unique_positions;
+			$right = $unique_nanos;
+			sort($left, SORT_STRING);
+			sort($right, SORT_STRING);
+			if ($left !== $right) {
+				$errors[] = __('Order line ticket codes do not match the live ticket rows one-to-one.', 'tickets-passes-legacy-importer');
 			}
 		}
 
@@ -349,6 +396,27 @@ final class TPFWLI_Tpfw_Adapter
 			'nanos'  => $nanos,
 			'count'  => $count,
 		);
+	}
+
+	/**
+	 * All tpfw_ticket_id_N values from the live WooCommerce item meta.
+	 *
+	 * @return array<int,list<string>>
+	 */
+	private function line_ticket_codes(WC_Order_Item $item): array
+	{
+		$out = array();
+		foreach ($item->get_meta_data() as $meta) {
+			$data = is_object($meta) && method_exists($meta, 'get_data') ? $meta->get_data() : array();
+			$key  = (string) ($data['key'] ?? '');
+			if (!preg_match('/^tpfw_ticket_id_(\d+)$/', $key, $parts)) {
+				continue;
+			}
+			$index = (int) $parts[1];
+			$value = $data['value'] ?? '';
+			$out[$index][] = is_scalar($value) ? trim((string) $value) : '';
+		}
+		return $out;
 	}
 
 	public function is_strict_ymd(string $date): bool
