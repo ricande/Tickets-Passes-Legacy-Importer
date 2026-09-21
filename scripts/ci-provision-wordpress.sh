@@ -82,6 +82,8 @@ fi
 
 "$WP" option update woocommerce_coming_soon 'no' --path="$WP_PATH"
 "$WP" option update woocommerce_manage_stock 'yes' --path="$WP_PATH"
+"$WP" option update woocommerce_email_from_address 'shop@example.com' --path="$WP_PATH"
+"$WP" option update woocommerce_email_from_name 'TPFWLI CI' --path="$WP_PATH"
 "$WP" option update woocommerce_custom_orders_table_enabled 'yes' --path="$WP_PATH"
 "$WP" option update woocommerce_feature_custom_order_tables_enabled 'yes' --path="$WP_PATH"
 "$WP" option update woocommerce_custom_orders_table_data_sync_enabled 'no' --path="$WP_PATH"
@@ -116,5 +118,22 @@ if (!defined("TPFW_VERSION")) {
 }
 echo "hpos=on tpfw=" . TPFW_VERSION . "\n";
 '
+
+if [[ -n "${TPFWLI_SMTP_HOST:-}" ]]; then
+	mkdir -p "$WP_PATH/wp-content/mu-plugins"
+	cat > "$WP_PATH/wp-content/mu-plugins/tpfwli-ci-smtp.php" <<PHP
+<?php
+/**
+ * CI-only SMTP to Mailpit. Not shipped in the plugin ZIP.
+ */
+add_action('phpmailer_init', static function (\$phpmailer): void {
+	\$phpmailer->isSMTP();
+	\$phpmailer->Host = getenv('TPFWLI_SMTP_HOST') ?: '127.0.0.1';
+	\$phpmailer->Port = (int) (getenv('TPFWLI_SMTP_PORT') ?: 1025);
+	\$phpmailer->SMTPAuth = false;
+	\$phpmailer->SMTPAutoTLS = false;
+});
+PHP
+fi
 
 echo "provision_ok wp=${INSTALLED_WP} wc=${INSTALLED_WC} tpfw=${TPFW_HEAD}"

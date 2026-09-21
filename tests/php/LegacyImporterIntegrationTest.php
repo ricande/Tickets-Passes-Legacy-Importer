@@ -3087,6 +3087,12 @@ final class LegacyImporterIntegrationTest extends TestCase
 
 	public function test_host_mailpit_receives_one_completed_import_email(): void
 	{
+		$mailpit_info = @file_get_contents('http://127.0.0.1:8025/api/v1/info', false, stream_context_create(array(
+			'http' => array('timeout' => 2, 'ignore_errors' => true),
+		)));
+		if (!is_string($mailpit_info) || $mailpit_info === '') {
+			$this->markTestSkipped('Mailpit is not available on 127.0.0.1:8025');
+		}
 		$input = $this->valid_input(array(
 			'email'      => 'mailpit-' . wp_generate_uuid4() . '@example.com',
 			'first_name' => 'MailpitReal',
