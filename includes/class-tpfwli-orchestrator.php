@@ -142,7 +142,8 @@ final class TPFWLI_Orchestrator
 
 			$need_stock_headroom = true;
 			if ($existing instanceof WC_Order) {
-				$need_stock_headroom = !$this->stock->is_reduced($existing);
+				$locked = wc_get_product($product_id);
+				$need_stock_headroom = !($locked instanceof WC_Product && $this->stock->is_accounted($existing, $locked, $quantity));
 			}
 
 			$product = $this->adapter->validate_ticket_product($product_id, $quantity, $need_stock_headroom);
@@ -265,6 +266,8 @@ final class TPFWLI_Orchestrator
 			);
 			return $this->result(false, array($result['error']), $order, array(), $result['current_stock']);
 		}
+
+		do_action('tpfwli_stock_checkpoint', 'after_commit', $order, $product);
 
 		if ((string) $order->get_meta(TPFWLI_Plugin::META_STOCK_STAGE) !== 'reduced') {
 			$this->orders->set_stage(

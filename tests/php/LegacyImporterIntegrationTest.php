@@ -346,6 +346,347 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame('not reduced', $stock->accounted_label(wc_get_order($order->get_id())));
 	}
 
+	public function test_stock_crash_after_product_change_rolls_back_and_retry_reduces_once(): void
+	{
+		$this->assertStockCrashThenRetry('after_product_stock');
+	}
+
+	public function test_stock_crash_after_line_meta_rolls_back_and_retry_reduces_once(): void
+	{
+		$this->assertStockCrashThenRetry('after_line_meta');
+	}
+
+	public function test_stock_crash_after_commit_before_stage_mark_retries_without_second_reduction(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-after-commit@example.com',
+			'first_name' => 'StockAfterCommit',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$hit = false;
+		$crash = static function (string $point) use (&$hit): void {
+			if ($point !== 'after_commit') {
+				return;
+			}
+			$hit = true;
+			throw new RuntimeException('stock-checkpoint:after_commit');
+		};
+		add_action('tpfwli_stock_checkpoint', $crash, 10, 1);
+		try {
+			(new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->fail('after_commit checkpoint should abort before stage mark');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('stock-checkpoint:after_commit', $e->getMessage());
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $crash, 10);
+		}
+		$this->assertTrue($hit);
+		$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$order = $found['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertTrue($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertNotSame('reduced', (string) $order->get_meta(TPFWLI_Plugin::META_STOCK_STAGE));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $retry['order']->get_id()));
+		$this->assertSame('reduced', (string) $retry['order']->get_meta(TPFWLI_Plugin::META_STOCK_STAGE));
+		$this->assertCount(2, $retry['nanos']);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_stock_process_abort_after_product_change_rolls_back(): void
+	{
+		$this->assertStockProcessAbortThenRetry('after_product_stock');
+	}
+
+	public function test_denied_stock_reduction_filter_does_not_accept_the_order_flag(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-denied@example.com',
+			'first_name' => 'StockDenied',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$deny = function ($allowed, $order) use ($input) {
+			if ($order instanceof WC_Order && (string) $order->get_meta(TPFWLI_Plugin::META_IMPORT_ID) === $input['import_id']) {
+				return false;
+			}
+			return $allowed;
+		};
+		add_filter('woocommerce_can_reduce_order_stock', $deny, 10, 2);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_filter('woocommerce_can_reduce_order_stock', $deny, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$order = $result['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		wp_cache_flush();
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertFalse((new TPFWLI_Stock_Service())->is_accounted(wc_get_order($order->get_id()), wc_get_product(self::$ticket_id), 2));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_filter_changing_reduction_quantity_is_not_accepted(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-qty-filter@example.com',
+			'first_name' => 'StockQtyFilter',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$filter = static function ($qty) {
+			return 1;
+		};
+		add_filter('woocommerce_order_item_quantity', $filter, 10, 1);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_filter('woocommerce_order_item_quantity', $filter, 10);
+		}
+		$this->assertFalse($result['ok']);
+		$order = $result['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		wp_cache_flush();
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_sql_error_during_stock_update_rolls_back_without_tickets(): void
+	{
+		$this->assertStockSqlFailureStopsImport('stock');
+	}
+
+	public function test_sql_error_during_reduced_stock_meta_rolls_back_without_tickets(): void
+	{
+		$this->assertStockSqlFailureStopsImport('itemmeta');
+	}
+
+	public function test_sql_error_during_stock_flag_rolls_back_without_tickets(): void
+	{
+		$this->assertStockSqlFailureStopsImport('flag');
+	}
+
+	public function test_existing_flag_without_reduced_stock_stops_before_issue(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-flag-only@example.com',
+			'first_name' => 'StockFlagOnly',
+			'quantity'   => '2',
+		));
+		$order = $this->bootstrap_identity($input);
+		$shaped = (new TPFWLI_Order_Shape())->assert_or_repair($order, wc_get_product(self::$ticket_id), 2);
+		$this->assertTrue($shaped['ok'], $shaped['error']);
+		$order = $shaped['order'];
+		$order->get_data_store()->set_stock_reduced($order->get_id(), true);
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		wp_cache_flush();
+		$this->assertTrue((new TPFWLI_Stock_Service())->is_reduced(wc_get_order($order->get_id())));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+
+		$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertFalse($result['ok']);
+		wp_cache_flush();
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_already_reduced_order_retries_without_further_stock_draw(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-already@example.com',
+			'first_name' => 'StockAlready',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$product = wc_get_product(self::$ticket_id);
+		$product->set_stock_quantity($start_stock - 5);
+		$product->save();
+		wp_cache_flush();
+
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'] || $retry['email_already'], implode('; ', $retry['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 5, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $first['order']->get_id()));
+		$this->assertSame($first['nanos'], $retry['nanos']);
+	}
+
+	public function test_insufficient_stock_at_confirm_does_not_issue_tickets(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-empty@example.com',
+			'first_name' => 'StockEmpty',
+			'quantity'   => '2',
+		));
+		$product = wc_get_product(self::$ticket_id);
+		$product->set_stock_quantity(1);
+		$product->save();
+		$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertFalse($result['ok']);
+		wp_cache_flush();
+		$this->assertSame(1, $this->db_product_stock(self::$ticket_id));
+		if ($result['order'] instanceof WC_Order) {
+			$this->assertSame(0, $this->count_tickets_for_order((int) $result['order']->get_id()));
+		}
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_other_order_stock_reduction_is_not_overwritten(): void
+	{
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$other = wc_create_order(array('status' => 'pending', 'customer_id' => 0));
+		$this->assertInstanceOf(WC_Order::class, $other);
+		$other->add_product(wc_get_product(self::$ticket_id), 1);
+		$other->save();
+		wc_maybe_reduce_stock_levels($other->get_id());
+		wp_cache_flush();
+		$this->assertSame($start_stock - 1, $this->db_product_stock(self::$ticket_id));
+
+		$input = $this->valid_input(array(
+			'email'      => 'stock-other-order@example.com',
+			'first_name' => 'StockOther',
+			'quantity'   => '2',
+		));
+		$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($result['ok'], implode('; ', $result['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 3, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(1, $this->db_line_reduced_stock((int) $other->get_id()));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $result['order']->get_id()));
+	}
+
+	public function test_concurrent_imports_with_different_ids_do_not_oversell(): void
+	{
+		if (!function_exists('proc_open')) {
+			$this->markTestSkipped('proc_open is not available');
+		}
+		$worker = dirname(__DIR__) . '/bin/confirm-worker.php';
+		if (!is_readable($worker)) {
+			$this->markTestSkipped('confirm worker is missing');
+		}
+		$product = wc_get_product(self::$ticket_id);
+		$product->set_stock_quantity(3);
+		$product->save();
+		$input_a = $this->valid_input(array(
+			'email'      => 'stock-race-a@example.com',
+			'first_name' => 'StockRaceA',
+			'quantity'   => '2',
+		));
+		$input_b = $this->valid_input(array(
+			'email'      => 'stock-race-b@example.com',
+			'first_name' => 'StockRaceB',
+			'quantity'   => '2',
+		));
+		$cmd = array(PHP_BINARY, $worker);
+		$spec = array(
+			0 => array('pipe', 'r'),
+			1 => array('pipe', 'w'),
+			2 => array('pipe', 'w'),
+		);
+		$p1 = proc_open($cmd, $spec, $pipes1);
+		$p2 = proc_open($cmd, $spec, $pipes2);
+		if (!is_resource($p1) || !is_resource($p2)) {
+			$this->markTestSkipped('Could not start concurrent PHP workers');
+		}
+		fwrite($pipes1[0], wp_json_encode($input_a));
+		fwrite($pipes2[0], wp_json_encode($input_b));
+		fclose($pipes1[0]);
+		fclose($pipes2[0]);
+		$out1 = stream_get_contents($pipes1[1]);
+		$out2 = stream_get_contents($pipes2[1]);
+		$err1 = stream_get_contents($pipes1[2]);
+		$err2 = stream_get_contents($pipes2[2]);
+		fclose($pipes1[1]);
+		fclose($pipes1[2]);
+		fclose($pipes2[1]);
+		fclose($pipes2[2]);
+		proc_close($p1);
+		proc_close($p2);
+		$a = json_decode((string) $out1, true);
+		$b = json_decode((string) $out2, true);
+		$this->assertIsArray($a, 'worker1: ' . $out1 . ' ' . $err1);
+		$this->assertIsArray($b, 'worker2: ' . $out2 . ' ' . $err2);
+		wp_cache_flush();
+		$stock = $this->db_product_stock(self::$ticket_id);
+		$ok_count = (!empty($a['ok']) ? 1 : 0) + (!empty($b['ok']) ? 1 : 0);
+		$this->assertSame(1, $ok_count, wp_json_encode(array($a, $b, $stock)));
+		$this->assertSame(1, $stock);
+		$winner = !empty($a['ok']) ? $a : $b;
+		$loser  = !empty($a['ok']) ? $b : $a;
+		$this->assertSame(2, $this->count_tickets_for_order((int) $winner['order_id']));
+		if ((int) $loser['order_id'] > 0) {
+			$this->assertSame(0, $this->count_tickets_for_order((int) $loser['order_id']));
+		}
+	}
+
+	public function test_stock_tables_include_product_lookup_and_notes(): void
+	{
+		global $wpdb;
+		$tables = TPFWLI_Dependencies::stock_storage_tables();
+		$this->assertContains($wpdb->postmeta, $tables);
+		$this->assertContains($wpdb->prefix . 'wc_product_meta_lookup', $tables);
+		$this->assertContains($wpdb->prefix . 'woocommerce_order_itemmeta', $tables);
+		$this->assertContains($wpdb->comments, $tables);
+		$this->assertContains($wpdb->commentmeta, $tables);
+		$this->assertSame(array(), TPFWLI_Dependencies::transactional_stock_storage_problems());
+	}
+
+	public function test_non_transactional_stock_engine_stops_reduction_on_existing_order(): void
+	{
+		global $wpdb;
+		$input = $this->valid_input(array(
+			'email'      => 'stock-engine@example.com',
+			'first_name' => 'StockEngine',
+			'quantity'   => '2',
+		));
+		$order = $this->bootstrap_identity($input);
+		$shaped = (new TPFWLI_Order_Shape())->assert_or_repair($order, wc_get_product(self::$ticket_id), 2);
+		$this->assertTrue($shaped['ok'], $shaped['error']);
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$probe = $this->createNonTransactionalProbeTable();
+		$filter = static function (array $tables) use ($probe) {
+			$tables[] = $probe;
+			return $tables;
+		};
+		add_filter('tpfwli_stock_storage_tables', $filter);
+		try {
+			$problems = TPFWLI_Dependencies::transactional_stock_storage_problems();
+			$this->assertNotSame(array(), $problems);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			wp_cache_flush();
+			$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+			$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+			$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		} finally {
+			remove_filter('tpfwli_stock_storage_tables', $filter);
+			$wpdb->query('DROP TABLE IF EXISTS `' . str_replace('`', '', $probe) . '`');
+		}
+	}
+
 	public function test_wrong_quantity_fails_closed_before_stock(): void
 	{
 		$input = $this->valid_input(array(
@@ -1700,6 +2041,193 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 		$tos = array_map('trim', explode(',', strtolower((string) $to)));
 		return in_array($needle, $tos, true);
+	}
+
+	private function db_product_stock(int $product_id): int
+	{
+		global $wpdb;
+		return (int) $wpdb->get_var($wpdb->prepare(
+			"SELECT meta_value FROM {$wpdb->postmeta} WHERE post_id = %d AND meta_key = %s",
+			$product_id,
+			'_stock'
+		));
+	}
+
+	private function db_line_reduced_stock(int $order_id): ?int
+	{
+		global $wpdb;
+		$item_id = $wpdb->get_var($wpdb->prepare(
+			"SELECT order_item_id FROM {$wpdb->prefix}woocommerce_order_items WHERE order_id = %d AND order_item_type = 'line_item' LIMIT 1",
+			$order_id
+		));
+		if (!$item_id) {
+			return null;
+		}
+		$value = $wpdb->get_var($wpdb->prepare(
+			"SELECT meta_value FROM {$wpdb->prefix}woocommerce_order_itemmeta WHERE order_item_id = %d AND meta_key = %s",
+			(int) $item_id,
+			'_reduced_stock'
+		));
+		return $value === null ? null : (int) $value;
+	}
+
+	private function db_order_stock_flag(int $order_id): bool
+	{
+		global $wpdb;
+		$value = $wpdb->get_var($wpdb->prepare(
+			"SELECT order_stock_reduced FROM {$wpdb->prefix}wc_order_operational_data WHERE order_id = %d",
+			$order_id
+		));
+		return $value === '1' || $value === 1 || $value === true;
+	}
+
+	private function assertStockCrashThenRetry(string $checkpoint): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'stock-crash-' . $checkpoint . '@example.com',
+			'first_name' => 'StockCrash',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$hit = false;
+		$crash = static function (string $point) use ($checkpoint, &$hit): void {
+			if ($point !== $checkpoint) {
+				return;
+			}
+			$hit = true;
+			throw new RuntimeException('stock-checkpoint:' . $checkpoint);
+		};
+		add_action('tpfwli_stock_checkpoint', $crash, 10, 1);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_action('tpfwli_stock_checkpoint', $crash, 10);
+		}
+		$this->assertTrue($hit, 'checkpoint ' . $checkpoint . ' was not reached');
+		$this->assertFalse($result['ok']);
+		$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$order = $found['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		wp_cache_flush();
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $retry['order']->get_id()));
+		$this->assertTrue($this->db_order_stock_flag((int) $retry['order']->get_id()));
+		$this->assertCount(2, $retry['nanos']);
+		$again = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame($retry['nanos'], $again['nanos']);
+	}
+
+	private function assertStockProcessAbortThenRetry(string $checkpoint): void
+	{
+		if (!function_exists('proc_open')) {
+			$this->markTestSkipped('proc_open is not available');
+		}
+		$worker = dirname(__DIR__) . '/bin/stock-crash-worker.php';
+		if (!is_readable($worker)) {
+			$this->markTestSkipped('stock crash worker is missing');
+		}
+		$input = $this->valid_input(array(
+			'email'      => 'stock-kill-' . $checkpoint . '@example.com',
+			'first_name' => 'StockKill',
+			'quantity'   => '2',
+		));
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$payload = wp_json_encode(array(
+			'input'      => $input,
+			'checkpoint' => $checkpoint,
+		));
+		$spec = array(
+			0 => array('pipe', 'r'),
+			1 => array('pipe', 'w'),
+			2 => array('pipe', 'w'),
+		);
+		$proc = proc_open(array(PHP_BINARY, $worker), $spec, $pipes);
+		$this->assertIsResource($proc);
+		fwrite($pipes[0], $payload);
+		fclose($pipes[0]);
+		$out = stream_get_contents($pipes[1]);
+		$err = stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		$code = proc_close($proc);
+		$decoded = json_decode((string) $out, true);
+		$this->assertTrue(!is_array($decoded) || empty($decoded['survived']), 'worker survived: ' . $out . ' ' . $err . ' code=' . $code);
+		wp_cache_flush();
+		$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$order = $found['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($retry['ok'], implode('; ', $retry['errors']));
+		wp_cache_flush();
+		$this->assertSame($start_stock - 2, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame(2, $this->db_line_reduced_stock((int) $retry['order']->get_id()));
+		$this->assertCount(2, $retry['nanos']);
+	}
+
+	private function assertStockSqlFailureStopsImport(string $which): void
+	{
+		global $wpdb;
+		$input = $this->valid_input(array(
+			'email'      => 'stock-sql-' . $which . '@example.com',
+			'first_name' => 'StockSql',
+			'quantity'   => '2',
+		));
+		$order = $this->bootstrap_identity($input);
+		$shaped = (new TPFWLI_Order_Shape())->assert_or_repair($order, wc_get_product(self::$ticket_id), 2);
+		$this->assertTrue($shaped['ok'], $shaped['error']);
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$previous_suppress = $wpdb->suppress_errors(true);
+		$filter = $this->failStockQueries(self::$ticket_id, $which);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		} finally {
+			remove_filter('query', $filter, 999);
+			$wpdb->suppress_errors((bool) $previous_suppress);
+		}
+		$this->assertFalse($result['ok']);
+		wp_cache_flush();
+		$this->assertSame($start_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertNull($this->db_line_reduced_stock((int) $order->get_id()));
+		$this->assertFalse($this->db_order_stock_flag((int) $order->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	private function failStockQueries(int $product_id, string $which): callable
+	{
+		$filter = static function ($sql) use ($product_id, $which) {
+			if (!is_string($sql)) {
+				return $sql;
+			}
+			if ($which === 'stock' && preg_match('/UPDATE\s+.*postmeta/i', $sql) && str_contains($sql, '_stock') && str_contains($sql, (string) $product_id)) {
+				return 'UPDATE tpfwli_missing_stock_table SET meta_value = 0 WHERE 1=0';
+			}
+			if ($which === 'itemmeta' && str_contains($sql, '_reduced_stock') && (stripos($sql, 'INSERT') !== false || stripos($sql, 'UPDATE') !== false || stripos($sql, 'REPLACE') !== false)) {
+				return 'INSERT INTO tpfwli_missing_itemmeta_table (meta_key) VALUES (1)';
+			}
+			if ($which === 'flag' && str_contains($sql, 'order_stock_reduced') && str_contains($sql, 'wc_order_operational_data') && preg_match('/VALUES\s*\(\s*\d+\s*,\s*1\s*\)/i', $sql)) {
+				return 'UPDATE tpfwli_missing_flag_table SET order_stock_reduced = 1 WHERE 1=0';
+			}
+			return $sql;
+		};
+		add_filter('query', $filter, 999);
+		return $filter;
 	}
 
 	private function count_import_orders(): int

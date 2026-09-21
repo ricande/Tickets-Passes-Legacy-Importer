@@ -127,6 +127,43 @@ final class TPFWLI_Dependencies
 		return apply_filters('tpfwli_bootstrap_storage_tables', $tables);
 	}
 
+	/**
+	 * Tables WooCommerce writes during importer stock reduction:
+	 * product _stock / lookup, line _reduced_stock, order_stock_reduced, notes.
+	 *
+	 * @return string[]
+	 */
+	public static function stock_storage_tables(): array
+	{
+		global $wpdb;
+
+		$tables = array(
+			$wpdb->posts,
+			$wpdb->postmeta,
+			$wpdb->comments,
+			$wpdb->commentmeta,
+			$wpdb->term_relationships,
+			$wpdb->term_taxonomy,
+			$wpdb->prefix . 'wc_product_meta_lookup',
+			$wpdb->prefix . 'woocommerce_order_items',
+			$wpdb->prefix . 'woocommerce_order_itemmeta',
+		);
+
+		if (class_exists(\Automattic\WooCommerce\Internal\DataStores\Orders\OrdersTableDataStore::class)) {
+			$named = \Automattic\WooCommerce\Internal\DataStores\Orders\OrdersTableDataStore::get_all_table_names_with_id();
+			if (is_array($named)) {
+				foreach ($named as $table) {
+					if (is_string($table) && $table !== '') {
+						$tables[] = $table;
+					}
+				}
+			}
+		}
+
+		$tables = array_values(array_unique(array_filter($tables)));
+		return apply_filters('tpfwli_stock_storage_tables', $tables);
+	}
+
 	public static function engine_is_transactional(string $engine): bool
 	{
 		return strtoupper(trim($engine)) === 'INNODB';
@@ -140,37 +177,58 @@ final class TPFWLI_Dependencies
 	 */
 	public static function transactional_storage_problems(): array
 	{
+		return self::engine_problems_for_tables(
+			self::bootstrap_storage_tables(),
+			__('Order storage table %s is missing, so first-time import cannot run inside a database transaction.', 'tickets-passes-legacy-importer'),
+			__('Order storage table %1$s uses %2$s, which cannot roll back a crashed first-time import. InnoDB is required. The table engine was not changed.', 'tickets-passes-legacy-importer'),
+			'tpfwli_transactional_storage_problems'
+		);
+	}
+
+	/**
+	 * Engine check for tables written during stock reduction, including retries.
+	 * Engines are never changed automatically.
+	 *
+	 * @return string[]
+	 */
+	public static function transactional_stock_storage_problems(): array
+	{
+		return self::engine_problems_for_tables(
+			self::stock_storage_tables(),
+			__('Stock storage table %s is missing, so stock reduction cannot run inside a database transaction.', 'tickets-passes-legacy-importer'),
+			__('Stock storage table %1$s uses %2$s, which cannot roll back a crashed stock reduction. InnoDB is required. The table engine was not changed.', 'tickets-passes-legacy-importer'),
+			'tpfwli_transactional_stock_storage_problems'
+		);
+	}
+
+	/**
+	 * @param string[] $tables
+	 * @return string[]
+	 */
+	private static function engine_problems_for_tables(array $tables, string $missing, string $wrong_engine, string $filter): array
+	{
 		global $wpdb;
 
 		$problems = array();
 		if (!$wpdb instanceof wpdb) {
 			$problems[] = __('Could not inspect order-table storage engines before import.', 'tickets-passes-legacy-importer');
-			return apply_filters('tpfwli_transactional_storage_problems', $problems);
+			return apply_filters($filter, $problems);
 		}
 
-		foreach (self::bootstrap_storage_tables() as $table) {
+		foreach ($tables as $table) {
 			$engine = $wpdb->get_var($wpdb->prepare(
 				'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
 				$table
 			));
 			if (!is_string($engine) || $engine === '') {
-				$problems[] = sprintf(
-					/* translators: %s: table name */
-					__('Order storage table %s is missing, so first-time import cannot run inside a database transaction.', 'tickets-passes-legacy-importer'),
-					$table
-				);
+				$problems[] = sprintf($missing, $table);
 				continue;
 			}
 			if (!self::engine_is_transactional($engine)) {
-				$problems[] = sprintf(
-					/* translators: 1: table name, 2: engine */
-					__('Order storage table %1$s uses %2$s, which cannot roll back a crashed first-time import. InnoDB is required. The table engine was not changed.', 'tickets-passes-legacy-importer'),
-					$table,
-					$engine
-				);
+				$problems[] = sprintf($wrong_engine, $table, $engine);
 			}
 		}
 
-		return apply_filters('tpfwli_transactional_storage_problems', $problems);
+		return apply_filters($filter, $problems);
 	}
 }
