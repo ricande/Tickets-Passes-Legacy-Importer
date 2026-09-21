@@ -2101,6 +2101,287 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 	}
 
+	public function test_result_page_uses_requested_order_not_stale_run(): void
+	{
+		$first = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'result-a@example.com',
+			'first_name' => 'ResultA',
+		)), 'confirm');
+		$second = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'result-b@example.com',
+			'first_name' => 'ResultB',
+		)), 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$this->assertTrue($second['ok'], implode('; ', $second['errors']));
+		$saved = $this->persistAdminRun($first);
+		$html = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $second['order']->get_id(),
+			TPFWLI_Admin_Page::RUN_QUERY => $saved['token'],
+		));
+		$this->assertStringContainsString('#' . $second['order']->get_id(), $html);
+		$this->assertStringNotContainsString('#' . $first['order']->get_id(), $html);
+		$this->assertStringContainsString((string) $second['order']->get_meta(TPFWLI_Plugin::META_IMPORT_ID), $html);
+		$this->assertStringNotContainsString((string) $first['order']->get_meta(TPFWLI_Plugin::META_IMPORT_ID), $html);
+	}
+
+	public function test_confirm_failure_without_order_shows_real_error_after_redirect(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'result-no-order@example.com',
+			'first_name' => 'ResultNoOrder',
+		));
+		$before = $this->count_import_orders();
+		$stock = $this->db_product_stock(self::$ticket_id);
+		$mail = count(self::$mail);
+		$_POST = $input;
+		$_POST['action'] = 'tpfwli_confirm';
+		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_confirm');
+		$_SERVER['REQUEST_METHOD'] = 'POST';
+		$fail = $this->failIdentityQueries($input['import_id'], 'meta', 1);
+		$location = '';
+		$redirect = static function ($url) {
+			throw new RuntimeException('redirect:' . $url);
+		};
+		add_filter('wp_redirect', $redirect, 999);
+		try {
+			(new TPFWLI_Admin_Page())->handle_confirm();
+			$this->fail('confirm should redirect');
+		} catch (RuntimeException $e) {
+			$this->assertStringContainsString('redirect:', $e->getMessage());
+			$location = substr($e->getMessage(), strlen('redirect:'));
+		} finally {
+			remove_filter('wp_redirect', $redirect, 999);
+			remove_filter('query', $fail, 999);
+			unset($_POST, $_REQUEST['_wpnonce']);
+		}
+		$query = array();
+		parse_str((string) wp_parse_url($location, PHP_URL_QUERY), $query);
+		$this->assertSame('result', $query['view'] ?? '');
+		$this->assertArrayNotHasKey('order_id', $query);
+		$this->assertArrayHasKey(TPFWLI_Admin_Page::RUN_QUERY, $query);
+		$this->assertStringNotContainsString($input['email'], $location);
+		$this->assertStringNotContainsString('Could not read', $location);
+		$html = $this->adminResultHtmlForGet(array(
+			'view' => 'result',
+			TPFWLI_Admin_Page::RUN_QUERY => (string) $query[TPFWLI_Admin_Page::RUN_QUERY],
+		));
+		$this->assertStringContainsString('Could not read existing importer orders', $html);
+		$this->assertStringContainsString($input['import_id'], $html);
+		$this->assertStringNotContainsString('No import result to show', $html);
+		$this->assertStringNotContainsString('name="action" value="tpfwli_resume"', $html);
+		$this->assertStringNotContainsString('name="action" value="tpfwli_retry_issue"', $html);
+		$this->assertSame($before, $this->count_import_orders());
+		$this->assertSame($stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame($mail, count(self::$mail));
+	}
+
+	public function test_two_runs_and_two_admins_do_not_mix_result_notices(): void
+	{
+		$one = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'tab-one@example.com',
+			'first_name' => 'TabOne',
+		)), 'confirm');
+		$two = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'tab-two@example.com',
+			'first_name' => 'TabTwo',
+		)), 'confirm');
+		$this->assertTrue($one['ok']);
+		$this->assertTrue($two['ok']);
+		$run_one = $this->persistAdminRun(array(
+			'ok'     => false,
+			'errors' => array('secret-run-one-notice'),
+			'order'  => $one['order'],
+		));
+		$run_two = $this->persistAdminRun(array(
+			'ok'            => true,
+			'errors'        => array('Email was already sent for this import. Normal retry will not send again.'),
+			'order'         => $two['order'],
+			'email_already' => true,
+		));
+		$html_one = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $one['order']->get_id(),
+			TPFWLI_Admin_Page::RUN_QUERY => $run_one['token'],
+		));
+		$html_two = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $two['order']->get_id(),
+			TPFWLI_Admin_Page::RUN_QUERY => $run_two['token'],
+		));
+		$this->assertStringContainsString('#' . $one['order']->get_id(), $html_one);
+		$this->assertStringContainsString('secret-run-one-notice', $html_one);
+		$this->assertStringNotContainsString('already sent', strtolower($html_one));
+		$this->assertStringContainsString('#' . $two['order']->get_id(), $html_two);
+		$this->assertStringContainsString('notice-info', $html_two);
+		$this->assertStringNotContainsString('notice-error', $html_two);
+		$this->assertStringNotContainsString('secret-run-one-notice', $html_two);
+
+		$other = new WP_User(self::$subscriber_id);
+		$other->add_cap('manage_woocommerce');
+		wp_set_current_user(self::$subscriber_id);
+		try {
+			$html_other = $this->adminResultHtmlForGet(array(
+				'view'     => 'result',
+				'order_id' => (string) $one['order']->get_id(),
+				TPFWLI_Admin_Page::RUN_QUERY => $run_one['token'],
+			));
+			$this->assertStringContainsString('#' . $one['order']->get_id(), $html_other);
+			$this->assertStringNotContainsString('secret-run-one-notice', $html_other);
+			$html_stolen = $this->adminResultHtmlForGet(array(
+				'view' => 'result',
+				TPFWLI_Admin_Page::RUN_QUERY => $run_one['token'],
+			));
+			$this->assertStringContainsString('expired', strtolower($html_stolen));
+		} finally {
+			$other->remove_cap('manage_woocommerce');
+			wp_set_current_user(self::$admin_id);
+		}
+	}
+
+	public function test_result_page_rejected_ids_do_not_fall_back(): void
+	{
+		$import = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'result-fallback@example.com',
+			'first_name' => 'ResultFallback',
+		)), 'confirm');
+		$this->assertTrue($import['ok']);
+		$saved = $this->persistAdminRun($import);
+		$web = wc_create_order();
+		$web->set_billing_email('web-result@example.com');
+		$web->add_product(wc_get_product(self::$simple_id), 1);
+		$web->save();
+
+		$missing = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => '999999001',
+			TPFWLI_Admin_Page::RUN_QUERY => $saved['token'],
+		));
+		$this->assertStringContainsString('could not be found', strtolower($missing));
+		$this->assertStringNotContainsString('#' . $import['order']->get_id(), $missing);
+
+		$web_html = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $web->get_id(),
+			TPFWLI_Admin_Page::RUN_QUERY => $saved['token'],
+		));
+		$this->assertStringContainsString('not a legacy import', strtolower($web_html));
+		$this->assertStringNotContainsString('#' . $import['order']->get_id(), $web_html);
+
+		$gone = wc_get_order($import['order']->get_id());
+		$gone->delete(true);
+		$deleted = $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $import['order']->get_id(),
+		));
+		$this->assertStringContainsString('could not be found', strtolower($deleted));
+
+		$expired = $this->adminResultHtmlForGet(array(
+			'view' => 'result',
+			TPFWLI_Admin_Page::RUN_QUERY => str_repeat('ab', 16),
+		));
+		$this->assertStringContainsString('expired', strtolower($expired));
+
+		$no_order = $this->persistAdminRun(array(
+			'ok'     => false,
+			'errors' => array('secret-no-order-identity-failure'),
+			'order'  => null,
+		), array('import_id' => 'import-should-not-leak'));
+		foreach (array('abc', '0', '-12', '') as $invalid) {
+			$invalid_html = $this->adminResultHtmlForGet(array(
+				'view'     => 'result',
+				'order_id' => $invalid,
+				TPFWLI_Admin_Page::RUN_QUERY => $no_order['token'],
+			));
+			$this->assertStringContainsString('order id is not valid', strtolower($invalid_html), $invalid);
+			$this->assertStringNotContainsString('secret-no-order-identity-failure', $invalid_html);
+			$this->assertStringNotContainsString('import-should-not-leak', $invalid_html);
+			$this->assertStringNotContainsString('#' . $import['order']->get_id(), $invalid_html);
+		}
+	}
+
+	public function test_result_get_does_not_mutate_import(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'result-get-safe@example.com',
+			'first_name' => 'ResultGetSafe',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok']);
+		$order_id = (int) $first['order']->get_id();
+		$before_orders = $this->count_import_orders();
+		$before_stock = $this->db_product_stock(self::$ticket_id);
+		$before_mail = count(self::$mail);
+		$before_stage = (string) wc_get_order($order_id)->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE);
+		$html = $this->adminResultHtml(wc_get_order($order_id));
+		$this->assertStringContainsString('#' . $order_id, $html);
+		$this->assertSame($before_orders, $this->count_import_orders());
+		$this->assertSame($before_stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame($before_mail, count(self::$mail));
+		$this->assertSame($before_stage, (string) wc_get_order($order_id)->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+	}
+
+	public function test_overview_paginates_stable_ids_and_preserves_result_links(): void
+	{
+		$stamp = gmdate('Y-m-d H:i:s', time() + YEAR_IN_SECONDS);
+		$created = array();
+		for ($i = 0; $i < 101; $i++) {
+			$created[] = $this->createStubImport(array(
+				'email' => 'page-' . $i . '@example.com',
+				'date'  => $stamp,
+			));
+		}
+		sort($created);
+		$list1 = (new TPFWLI_Import_Repository())->list_imports(1, 50);
+		$list2 = (new TPFWLI_Import_Repository())->list_imports(2, 50);
+		$list3 = (new TPFWLI_Import_Repository())->list_imports(3, 50);
+		$this->assertTrue($list1['ok'], $list1['error'] ?? '');
+		$ids1 = array_map(static function ($order) {
+			return (int) $order->get_id();
+		}, $list1['orders']);
+		$ids2 = array_map(static function ($order) {
+			return (int) $order->get_id();
+		}, $list2['orders']);
+		$ids3 = array_map(static function ($order) {
+			return (int) $order->get_id();
+		}, $list3['orders']);
+		$this->assertSame(array_reverse(array_slice($created, 51)), $ids1);
+		$this->assertSame(array_reverse(array_slice($created, 1, 50)), $ids2);
+		$this->assertSame($created[0], $ids3[0]);
+		$this->assertSame(array(), array_intersect($ids1, $ids2));
+
+		$html = $this->adminOverviewHtml(3);
+		$this->assertStringContainsString('tpfwli_page=2', $html);
+		$this->assertStringContainsString('order_id=' . $created[0], $html);
+		$this->assertStringNotContainsString('No legacy imports yet', $html);
+
+		$bad = $this->adminOverviewHtmlRaw('nope');
+		$this->assertStringContainsString('page number is not valid', strtolower($bad));
+		$outside = $this->adminOverviewHtml(9999);
+		$this->assertStringContainsString('no imports on this page', strtolower($outside));
+		$this->assertStringNotContainsString('No legacy imports yet', $outside);
+	}
+
+	public function test_overview_read_error_is_not_an_empty_list(): void
+	{
+		$fail = static function ($sql) {
+			if (is_string($sql) && str_contains($sql, TPFWLI_Plugin::META_IMPORT) && !str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID)) {
+				return 'SELECT id FROM tpfwli_missing_import_list WHERE id = 1';
+			}
+			return $sql;
+		};
+		add_filter('query', $fail, 999);
+		try {
+			$list = (new TPFWLI_Import_Repository())->list_imports(1, 50);
+			$this->assertFalse($list['ok']);
+			$html = $this->adminOverviewHtml(1);
+			$this->assertStringContainsString('Could not read the legacy import list', $html);
+			$this->assertStringNotContainsString('No legacy imports yet', $html);
+		} finally {
+			remove_filter('query', $fail, 999);
+		}
+	}
+
 	public function test_deferred_queue_after_sent_does_not_duplicate_customer_email(): void
 	{
 		$input = $this->valid_input(array(
@@ -3908,18 +4189,44 @@ final class LegacyImporterIntegrationTest extends TestCase
 
 	private function adminResultHtml(WC_Order $order): string
 	{
+		return $this->adminResultHtmlForGet(array(
+			'view'     => 'result',
+			'order_id' => (string) $order->get_id(),
+		));
+	}
+
+	/**
+	 * @param array<string,string> $get
+	 */
+	private function adminResultHtmlForGet(array $get): string
+	{
 		if (!function_exists('submit_button')) {
 			require_once ABSPATH . 'wp-admin/includes/template.php';
 		}
-		delete_transient('tpfwli_result_' . get_current_user_id());
-		$_GET['view'] = 'result';
-		$_GET['order_id'] = (string) $order->get_id();
+		$prev = $_GET;
+		$_GET = $get;
 		$page = new TPFWLI_Admin_Page();
 		ob_start();
 		(new ReflectionMethod($page, 'render_result'))->invoke($page);
 		$html = (string) ob_get_clean();
-		unset($_GET['view'], $_GET['order_id']);
+		$_GET = $prev;
 		return $html;
+	}
+
+	/**
+	 * @param array<string,mixed> $result
+	 * @param array<string,mixed> $input
+	 * @return array{token:string,args:array<string,string>}
+	 */
+	private function persistAdminRun(array $result, array $input = array()): array
+	{
+		$page = new TPFWLI_Admin_Page();
+		$method = new ReflectionMethod($page, 'persist_run');
+		$method->setAccessible(true);
+		$saved = $method->invoke($page, $result, $input);
+		$this->assertIsArray($saved);
+		$this->assertNotSame('', $saved['token'] ?? '');
+		return $saved;
 	}
 
 	/**
@@ -3936,17 +4243,30 @@ final class LegacyImporterIntegrationTest extends TestCase
 			throw new RuntimeException('redirect:' . $location);
 		};
 		add_filter('wp_redirect', $redirect, 999);
+		$location = '';
 		try {
 			(new TPFWLI_Admin_Page())->handle_resume();
 			$this->fail('resume POST should redirect');
 		} catch (RuntimeException $e) {
 			$this->assertStringContainsString('redirect:', $e->getMessage());
+			$location = substr($e->getMessage(), strlen('redirect:'));
 		} finally {
 			remove_filter('wp_redirect', $redirect, 999);
 			unset($_POST, $_REQUEST['_wpnonce']);
 		}
-		$flash = get_transient('tpfwli_result_' . get_current_user_id());
+		$query = array();
+		parse_str((string) wp_parse_url($location, PHP_URL_QUERY), $query);
+		$token = isset($query[TPFWLI_Admin_Page::RUN_QUERY]) ? (string) $query[TPFWLI_Admin_Page::RUN_QUERY] : '';
+		$this->assertNotSame('', $token, $location);
+		$flash = get_transient('tpfwli_run_' . get_current_user_id() . '_' . $token);
 		$this->assertIsArray($flash);
+		$order_id = (int) ($flash['order_id'] ?? 0);
+		if ($order_id > 0) {
+			$order = wc_get_order($order_id);
+			$this->assertInstanceOf(WC_Order::class, $order);
+			$flash['order'] = $order;
+			$flash['nanos'] = (new TPFWLI_Orchestrator())->inspect($order)['nanos'];
+		}
 		return $flash;
 	}
 
@@ -4637,5 +4957,51 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 		$product->update_meta_data('_tpfw_ticket_user_start_date_enable', !empty($args['user_start']) ? 'yes' : 'no');
 		return $product->save();
+	}
+
+	/**
+	 * @param array<string,mixed> $args
+	 */
+	private function createStubImport(array $args): int
+	{
+		$import_id = (string) ($args['import_id'] ?? wp_generate_uuid4());
+		$order = new WC_Order();
+		$order->set_status('completed');
+		$order->set_billing_email((string) ($args['email'] ?? 'stub@example.com'));
+		$order->set_billing_first_name('Stub');
+		$order->set_created_via(TPFWLI_Plugin::created_via($import_id));
+		if (!empty($args['date'])) {
+			$order->set_date_created($args['date']);
+		}
+		$order->update_meta_data(TPFWLI_Plugin::META_IMPORT, 'yes');
+		$order->update_meta_data(TPFWLI_Plugin::META_IMPORT_ID, $import_id);
+		$order->update_meta_data(TPFWLI_Plugin::META_ISSUE_STAGE, 'issued');
+		$order->update_meta_data(TPFWLI_Plugin::META_EMAIL_STAGE, 'sent');
+		$order->update_meta_data(TPFWLI_Plugin::META_STOCK_STAGE, 'reduced');
+		return (int) $order->save();
+	}
+
+	private function adminOverviewHtml(int $page): string
+	{
+		return $this->adminOverviewHtmlRaw((string) $page);
+	}
+
+	private function adminOverviewHtmlRaw(string $page): string
+	{
+		if (!function_exists('submit_button')) {
+			require_once ABSPATH . 'wp-admin/includes/template.php';
+		}
+		$prev = $_GET;
+		$_GET = array(
+			'page' => TPFWLI_Admin_Page::SLUG,
+			'view' => 'overview',
+			TPFWLI_Admin_Page::PAGE_QUERY => $page,
+		);
+		$admin = new TPFWLI_Admin_Page();
+		ob_start();
+		(new ReflectionMethod($admin, 'render_overview'))->invoke($admin);
+		$html = (string) ob_get_clean();
+		$_GET = $prev;
+		return $html;
 	}
 }

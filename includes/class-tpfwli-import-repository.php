@@ -75,25 +75,175 @@ final class TPFWLI_Import_Repository
 	}
 
 	/**
-	 * @return WC_Order[]
+	 * @return array{ok:bool,orders:WC_Order[],total:int,pages:int,page:int,error:string}
 	 */
-	public function list_imports(int $page = 1, int $per_page = 20): array
+	public function list_imports(int $page = 1, int $per_page = 50): array
 	{
-		$page     = max(1, $page);
-		$per_page = max(1, min(100, $per_page));
+		$this->last_error = '';
+		$page             = max(1, $page);
+		$per_page         = max(1, min(50, $per_page));
+		$empty            = array(
+			'ok'     => true,
+			'orders' => array(),
+			'total'  => 0,
+			'pages'  => 0,
+			'page'   => $page,
+			'error'  => '',
+		);
 
-		$orders = wc_get_orders(array(
+		$queried = $this->query_import_list_page($page, $per_page);
+		if (!$queried['ok']) {
+			$this->last_error = $queried['error'];
+			return array(
+				'ok'     => false,
+				'orders' => array(),
+				'total'  => 0,
+				'pages'  => 0,
+				'page'   => $page,
+				'error'  => $this->last_error,
+			);
+		}
+
+		$out = array();
+		foreach ($queried['ids'] as $id) {
+			$order = wc_get_order((int) $id);
+			if (!$order instanceof WC_Order) {
+				$this->last_error = __('Could not read the legacy import list.', 'tickets-passes-legacy-importer');
+				return array(
+					'ok'     => false,
+					'orders' => array(),
+					'total'  => 0,
+					'pages'  => 0,
+					'page'   => $page,
+					'error'  => $this->last_error,
+				);
+			}
+			$out[] = $order;
+		}
+
+		$empty['ok']     = true;
+		$empty['orders'] = $out;
+		$empty['total']  = $queried['total'];
+		$empty['pages']  = $queried['pages'];
+		return $empty;
+	}
+
+	/**
+	 * @return array{ok:bool,ids:int[],total:int,pages:int,error:string}
+	 */
+	private function query_import_list_page(int $page, int $per_page): array
+	{
+		$read_error = __('Could not read the legacy import list.', 'tickets-passes-legacy-importer');
+		$args       = array(
 			'limit'      => $per_page,
 			'page'       => $page,
-			'orderby'    => 'date',
-			'order'      => 'DESC',
+			'paginate'   => true,
+			'orderby'    => array(
+				'date' => 'DESC',
+				'ID'   => 'DESC',
+			),
 			'status'     => 'any',
 			'meta_key'   => TPFWLI_Plugin::META_IMPORT,
 			'meta_value' => 'yes',
-			'return'     => 'objects',
-		));
+			'return'     => 'ids',
+		);
 
-		return is_array($orders) ? $orders : array();
+		global $wpdb;
+		$previous_suppress = null;
+		$previous_show     = null;
+		$awaiting          = false;
+		$seen              = false;
+		$sql_error         = '';
+		$exception_error   = '';
+		$watcher           = null;
+		$result            = null;
+
+		$capture = static function () use (&$awaiting, &$seen, &$sql_error): void {
+			global $wpdb;
+			if (!$awaiting) {
+				return;
+			}
+			$awaiting = false;
+			$seen     = true;
+			if ($sql_error !== '') {
+				return;
+			}
+			if ($wpdb instanceof wpdb) {
+				$sql_error = (string) $wpdb->last_error;
+			}
+		};
+
+		if ($wpdb instanceof wpdb) {
+			$previous_suppress = $wpdb->suppress_errors(true);
+			$previous_show     = $wpdb->show_errors(false);
+			$watcher = static function ($sql) use (&$awaiting, &$seen, &$sql_error, $capture) {
+				$capture();
+				if ($sql_error !== '' || $seen) {
+					return $sql;
+				}
+				if (is_string($sql) && self::sql_looks_like_import_list_query($sql)) {
+					$awaiting = true;
+				}
+				return $sql;
+			};
+			add_filter('query', $watcher, 1);
+		}
+
+		try {
+			$result = wc_get_orders($args);
+			$capture();
+		} catch (Throwable $e) {
+			$capture();
+			if ($sql_error === '') {
+				$exception_error = $e->getMessage();
+			}
+			$result = null;
+		} finally {
+			if (is_callable($watcher)) {
+				remove_filter('query', $watcher, 1);
+			}
+			if ($wpdb instanceof wpdb) {
+				$wpdb->suppress_errors((bool) $previous_suppress);
+				$wpdb->show_errors((bool) $previous_show);
+			}
+		}
+
+		if ($sql_error !== '' || $exception_error !== '') {
+			return array('ok' => false, 'ids' => array(), 'total' => 0, 'pages' => 0, 'error' => $read_error);
+		}
+		if ($result instanceof WP_Error || !is_object($result)) {
+			return array('ok' => false, 'ids' => array(), 'total' => 0, 'pages' => 0, 'error' => $read_error);
+		}
+
+		$ids = array();
+		foreach ((array) ($result->orders ?? array()) as $id) {
+			if (!is_numeric($id) || (int) $id < 1) {
+				return array('ok' => false, 'ids' => array(), 'total' => 0, 'pages' => 0, 'error' => $read_error);
+			}
+			$ids[] = (int) $id;
+		}
+
+		$total = isset($result->total) ? (int) $result->total : 0;
+		$pages = isset($result->max_num_pages) ? (int) $result->max_num_pages : 0;
+		if ($total < 0 || $pages < 0) {
+			return array('ok' => false, 'ids' => array(), 'total' => 0, 'pages' => 0, 'error' => $read_error);
+		}
+
+		return array(
+			'ok'    => true,
+			'ids'   => $ids,
+			'total' => $total,
+			'pages' => $pages,
+			'error' => '',
+		);
+	}
+
+	private static function sql_looks_like_import_list_query(string $sql): bool
+	{
+		if (str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID)) {
+			return false;
+		}
+		return str_contains($sql, TPFWLI_Plugin::META_IMPORT);
 	}
 
 	/**

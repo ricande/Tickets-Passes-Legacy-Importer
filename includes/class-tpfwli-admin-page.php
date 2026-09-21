@@ -8,6 +8,12 @@ final class TPFWLI_Admin_Page
 {
 	const SLUG = 'tpfwli-legacy-importer';
 
+	public const RUN_QUERY = 'tpfwli_run';
+
+	public const PAGE_QUERY = 'tpfwli_page';
+
+	public const PAGE_SIZE = 50;
+
 	private TPFWLI_Input_Validator $validator;
 	private TPFWLI_Orchestrator $orchestrator;
 	private TPFWLI_Import_Repository $repository;
@@ -131,13 +137,49 @@ final class TPFWLI_Admin_Page
 
 	private function store_run(array $result): void
 	{
-		$order_id = ($result['order'] instanceof WC_Order) ? (int) $result['order']->get_id() : 0;
-		set_transient($this->flash_key('result'), $result, 10 * MINUTE_IN_SECONDS);
-		wp_safe_redirect($this->url(array(
-			'view'     => 'result',
-			'order_id' => (string) $order_id,
-		)));
+		$saved = $this->persist_run($result, $this->posted_input());
+		wp_safe_redirect($this->url($saved['args']));
 		exit;
+	}
+
+	/**
+	 * @param array<string,mixed> $result
+	 * @param array<string,mixed> $input
+	 * @return array{token:string,args:array<string,string>}
+	 */
+	private function persist_run(array $result, array $input = array()): array
+	{
+		$order_id  = ($result['order'] instanceof WC_Order) ? (int) $result['order']->get_id() : 0;
+		$import_id = '';
+		if ($result['order'] instanceof WC_Order) {
+			$import_id = (string) $result['order']->get_meta(TPFWLI_Plugin::META_IMPORT_ID);
+		}
+		if ($import_id === '' && !empty($input['import_id'])) {
+			$import_id = sanitize_text_field((string) $input['import_id']);
+		}
+
+		$token = $this->new_run_token();
+		set_transient(
+			$this->run_key($token),
+			array(
+				'order_id'      => $order_id,
+				'import_id'     => $import_id,
+				'ok'            => !empty($result['ok']),
+				'errors'        => array_values(array_filter(array_map('strval', $result['errors'] ?? array()))),
+				'email_already' => !empty($result['email_already']),
+				'email_unknown' => !empty($result['email_unknown']),
+			),
+			10 * MINUTE_IN_SECONDS
+		);
+
+		$args = array(
+			'view'         => 'result',
+			self::RUN_QUERY => $token,
+		);
+		if ($order_id > 0) {
+			$args['order_id'] = (string) $order_id;
+		}
+		return array('token' => $token, 'args' => $args);
 	}
 
 	private function require_post(string $action): void
@@ -276,29 +318,59 @@ final class TPFWLI_Admin_Page
 
 	private function render_result(): void
 	{
-		$flash = get_transient($this->flash_key('result'));
-		$order = null;
-		if (is_array($flash) && !empty($flash['order']) && $flash['order'] instanceof WC_Order) {
-			$order = wc_get_order($flash['order']->get_id());
-		} elseif (!empty($_GET['order_id'])) {
-			$order = wc_get_order(absint($_GET['order_id']));
-			if ($order && !$this->is_importer_order($order)) {
-				$order = null;
-			}
-		}
+		$requested    = $this->requested_order();
+		$token        = $this->requested_run_token();
+		$run          = $this->load_run($token);
 
-		if (!$order instanceof WC_Order) {
-			echo '<div class="notice notice-error"><p>' . esc_html__('No import result to show.', 'tickets-passes-legacy-importer') . '</p></div>';
+		if ($requested['present'] && !$requested['ok']) {
+			echo '<div class="notice notice-error"><p>' . esc_html__('The requested order ID is not valid.', 'tickets-passes-legacy-importer') . '</p></div>';
 			return;
 		}
 
-		$errors = is_array($flash) ? ($flash['errors'] ?? array()) : array();
-		$state  = $this->orchestrator->inspect($order);
-		$nanos  = $state['nanos'];
-		foreach ($errors as $error) {
-			echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
+		$requested_id = $requested['id'];
+		if ($requested_id > 0) {
+			$order = wc_get_order($requested_id);
+			if (!$order instanceof WC_Order) {
+				echo '<div class="notice notice-error"><p>' . esc_html__('This import order could not be found.', 'tickets-passes-legacy-importer') . '</p></div>';
+				return;
+			}
+			if (!$this->is_importer_order($order)) {
+				echo '<div class="notice notice-error"><p>' . esc_html__('This order is not a legacy import.', 'tickets-passes-legacy-importer') . '</p></div>';
+				return;
+			}
+			$notices = (is_array($run) && (int) ($run['order_id'] ?? 0) === $requested_id) ? $run : null;
+			$this->render_run_notices($notices);
+			$this->render_order_result($order);
+			return;
 		}
 
+		if ($token !== '' && $run === null) {
+			echo '<div class="notice notice-warning"><p>' . esc_html__('This import result has expired.', 'tickets-passes-legacy-importer') . '</p></div>';
+			return;
+		}
+
+		if (is_array($run) && (int) ($run['order_id'] ?? 0) === 0) {
+			$this->render_run_notices($run);
+			if (!empty($run['import_id'])) {
+				echo '<table class="widefat striped"><tbody>';
+				$this->kv(__('Legacy import ID', 'tickets-passes-legacy-importer'), (string) $run['import_id']);
+				echo '</tbody></table>';
+			}
+			return;
+		}
+
+		if (is_array($run) && (int) ($run['order_id'] ?? 0) > 0) {
+			echo '<div class="notice notice-error"><p>' . esc_html__('This result link is missing its order.', 'tickets-passes-legacy-importer') . '</p></div>';
+			return;
+		}
+
+		echo '<div class="notice notice-error"><p>' . esc_html__('No import result to show.', 'tickets-passes-legacy-importer') . '</p></div>';
+	}
+
+	private function render_order_result(WC_Order $order): void
+	{
+		$state = $this->orchestrator->inspect($order);
+		$nanos = $state['nanos'];
 		$stock_stage  = $state['stock_stage'];
 		$issue_stage  = $state['issue_stage'];
 		$email_stage  = $state['email_stage'];
@@ -347,17 +419,71 @@ final class TPFWLI_Admin_Page
 		}
 	}
 
+	/**
+	 * @param array<string,mixed>|null $run
+	 */
+	private function render_run_notices(?array $run): void
+	{
+		if (!is_array($run)) {
+			return;
+		}
+		if (!empty($run['email_already'])) {
+			echo '<div class="notice notice-info"><p>' . esc_html__('Email was already sent for this import. Normal retry will not send again.', 'tickets-passes-legacy-importer') . '</p></div>';
+		}
+		if (!empty($run['email_unknown'])) {
+			echo '<div class="notice notice-warning"><p>' . esc_html__('Previous email attempt has an unknown outcome. Verify before forcing a resend.', 'tickets-passes-legacy-importer') . '</p></div>';
+		}
+		foreach ((array) ($run['errors'] ?? array()) as $error) {
+			$error = (string) $error;
+			if ($error === '' || $this->is_already_sent_message($error)) {
+				continue;
+			}
+			echo '<div class="notice notice-error"><p>' . esc_html($error) . '</p></div>';
+		}
+	}
+
 	private function render_overview(): void
 	{
-		$orders = $this->repository->list_imports(1, 50);
+		$parsed = $this->requested_list_page();
+		if (!$parsed['ok']) {
+			echo '<div class="notice notice-error"><p>' . esc_html__('The requested page number is not valid.', 'tickets-passes-legacy-importer') . '</p></div>';
+		}
+		$page = $parsed['page'];
+		$list = $this->repository->list_imports($page, self::PAGE_SIZE);
+		if (empty($list['ok'])) {
+			echo '<div class="notice notice-error"><p>' . esc_html($list['error'] !== '' ? $list['error'] : __('Could not read the legacy import list.', 'tickets-passes-legacy-importer')) . '</p></div>';
+			return;
+		}
+
+		$total = (int) $list['total'];
+		$pages = (int) $list['pages'];
+		$orders = $list['orders'];
+
+		if ($total === 0 && $page === 1) {
+			echo '<p>' . esc_html__('No legacy imports yet.', 'tickets-passes-legacy-importer') . '</p>';
+			return;
+		}
+		if ($total === 0 || $page > max(1, $pages)) {
+			echo '<div class="notice notice-warning"><p>' . esc_html__('There are no imports on this page.', 'tickets-passes-legacy-importer') . '</p></div>';
+			echo '<p><a href="' . esc_url($this->url(array('view' => 'overview', self::PAGE_QUERY => (string) max(1, $pages)))) . '">' . esc_html__('Go to the last page', 'tickets-passes-legacy-importer') . '</a></p>';
+			return;
+		}
+
+		echo '<p>' . esc_html(
+			sprintf(
+				/* translators: 1: current page, 2: total pages, 3: total imports */
+				__('Page %1$d of %2$d (%3$d imports)', 'tickets-passes-legacy-importer'),
+				$page,
+				max(1, $pages),
+				$total
+			)
+		) . '</p>';
+
 		echo '<table class="widefat striped"><thead><tr>';
 		foreach (array('Import date', 'Name', 'Email', 'Product', 'Quantity', 'Order ID', 'Stock', 'Issue', 'Email', 'Actions') as $col) {
 			echo '<th>' . esc_html__($col, 'tickets-passes-legacy-importer') . '</th>';
 		}
 		echo '</tr></thead><tbody>';
-		if (!$orders) {
-			echo '<tr><td colspan="10">' . esc_html__('No legacy imports yet.', 'tickets-passes-legacy-importer') . '</td></tr>';
-		}
 		foreach ($orders as $order) {
 			if (!$order instanceof WC_Order) {
 				continue;
@@ -384,6 +510,30 @@ final class TPFWLI_Admin_Page
 			echo '</tr>';
 		}
 		echo '</tbody></table>';
+		$this->render_pagination($page, $pages);
+	}
+
+	private function render_pagination(int $page, int $pages): void
+	{
+		if ($pages < 2) {
+			return;
+		}
+		echo '<p class="tpfwli-pagination">';
+		if ($page > 1) {
+			echo '<a href="' . esc_url($this->url(array('view' => 'overview', self::PAGE_QUERY => (string) ($page - 1)))) . '">' . esc_html__('Previous', 'tickets-passes-legacy-importer') . '</a> ';
+		}
+		echo '<span>' . esc_html(
+			sprintf(
+				/* translators: 1: current page, 2: total pages */
+				__('Page %1$d of %2$d', 'tickets-passes-legacy-importer'),
+				$page,
+				$pages
+			)
+		) . '</span>';
+		if ($page < $pages) {
+			echo ' <a href="' . esc_url($this->url(array('view' => 'overview', self::PAGE_QUERY => (string) ($page + 1)))) . '">' . esc_html__('Next', 'tickets-passes-legacy-importer') . '</a>';
+		}
+		echo '</p>';
 	}
 
 	/**
@@ -437,5 +587,71 @@ final class TPFWLI_Admin_Page
 	private function flash_key(string $kind): string
 	{
 		return 'tpfwli_' . $kind . '_' . get_current_user_id();
+	}
+
+	private function run_key(string $token): string
+	{
+		return 'tpfwli_run_' . get_current_user_id() . '_' . $token;
+	}
+
+	private function new_run_token(): string
+	{
+		return bin2hex(random_bytes(16));
+	}
+
+	/**
+	 * @return array{present:bool,ok:bool,id:int}
+	 */
+	private function requested_order(): array
+	{
+		if (!isset($_GET['order_id'])) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return array('present' => false, 'ok' => true, 'id' => 0);
+		}
+		$raw = wp_unslash((string) $_GET['order_id']); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ($raw === '' || !ctype_digit($raw) || (int) $raw < 1) {
+			return array('present' => true, 'ok' => false, 'id' => 0);
+		}
+		return array('present' => true, 'ok' => true, 'id' => (int) $raw);
+	}
+
+	private function requested_run_token(): string
+	{
+		if (!isset($_GET[self::RUN_QUERY])) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return '';
+		}
+		$token = sanitize_key((string) wp_unslash($_GET[self::RUN_QUERY])); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		return preg_match('/^[a-f0-9]{16,64}$/', $token) ? $token : '';
+	}
+
+	/**
+	 * @return array<string,mixed>|null
+	 */
+	private function load_run(string $token): ?array
+	{
+		if ($token === '') {
+			return null;
+		}
+		$data = get_transient($this->run_key($token));
+		return is_array($data) ? $data : null;
+	}
+
+	/**
+	 * @return array{ok:bool,page:int}
+	 */
+	private function requested_list_page(): array
+	{
+		if (!isset($_GET[self::PAGE_QUERY])) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			return array('ok' => true, 'page' => 1);
+		}
+		$raw = wp_unslash((string) $_GET[self::PAGE_QUERY]); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		if ($raw === '' || !ctype_digit($raw) || (int) $raw < 1) {
+			return array('ok' => false, 'page' => 1);
+		}
+		return array('ok' => true, 'page' => (int) $raw);
+	}
+
+	private function is_already_sent_message(string $error): bool
+	{
+		return str_contains(strtolower($error), 'already sent');
 	}
 }
