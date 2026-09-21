@@ -80,6 +80,11 @@ final class TPFWLI_Orchestrator
 		$data      = $customer['data'];
 		$import_id = $data['import_id'];
 
+		$problems = TPFWLI_Dependencies::problems(true);
+		if ($problems !== array()) {
+			return $this->fail_result($problems, null, $import_id);
+		}
+
 		global $wpdb;
 		$lock = new TPFWLI_Import_Lock($wpdb, $import_id);
 		if (!$lock->acquire(15)) {

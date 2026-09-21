@@ -2,8 +2,9 @@
 /**
  * Live verification: atomic bootstrap rollback at three crash points, then retry.
  */
-$wp_root = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
-require $wp_root . '/wp-load.php';
+require dirname(__DIR__) . '/lib/checkout-code.php';
+tpfwli_test_load_wordpress();
+tpfwli_test_reject_foreign_importer_if_loaded();
 
 if (!class_exists('TPFWLI_Orchestrator')) {
 	fwrite(STDERR, "Importer not loaded\n");

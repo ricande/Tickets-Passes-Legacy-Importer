@@ -8,6 +8,10 @@ defined('ABSPATH') || exit;
  * `created_via` is an extra lookup/audit key for committed orders. Crash safety
  * for first-time create is the MySQL transaction in TPFWLI_Order_Service, not
  * the assumption that created_via lands in the first HPOS INSERT.
+ *
+ * WooCommerce 11.1 OrdersTableQuery::run_query() uses $wpdb->get_col() and treats
+ * a SQL failure as an empty ID list. This repository therefore captures the
+ * identity query's own error before any follow-up lookup can overwrite it.
  */
 final class TPFWLI_Import_Repository
 {
@@ -29,11 +33,23 @@ final class TPFWLI_Import_Repository
 			return array('ok' => true, 'order' => null, 'error' => '');
 		}
 
+		$meta = $this->query_by_meta($import_id);
+		if (!$meta['ok']) {
+			$this->last_error = $meta['error'];
+			return array('ok' => false, 'order' => null, 'error' => $this->last_error);
+		}
+
+		$via = $this->query_by_created_via($import_id);
+		if (!$via['ok']) {
+			$this->last_error = $via['error'];
+			return array('ok' => false, 'order' => null, 'error' => $this->last_error);
+		}
+
 		$found = array();
-		foreach ($this->query_by_meta($import_id) as $order) {
+		foreach ($meta['orders'] as $order) {
 			$found[(int) $order->get_id()] = $order;
 		}
-		foreach ($this->query_by_created_via($import_id) as $order) {
+		foreach ($via['orders'] as $order) {
 			$found[(int) $order->get_id()] = $order;
 		}
 
@@ -79,49 +95,90 @@ final class TPFWLI_Import_Repository
 	}
 
 	/**
-	 * @return WC_Order[]
+	 * @return array{ok:bool,orders:WC_Order[],error:string}
 	 */
 	private function query_by_meta(string $import_id): array
 	{
-		$orders = wc_get_orders(array(
-			'limit'      => 2,
-			'status'     => 'any',
-			'meta_key'   => TPFWLI_Plugin::META_IMPORT_ID,
-			'meta_value' => $import_id,
-			'return'     => 'objects',
-		));
-		return $this->as_orders($orders);
+		return $this->query_identity_orders(
+			array(
+				'limit'      => 2,
+				'status'     => 'any',
+				'meta_key'   => TPFWLI_Plugin::META_IMPORT_ID,
+				'meta_value' => $import_id,
+				'return'     => 'objects',
+			),
+			__('Could not read existing importer orders by import ID. Import was stopped before any changes.', 'tickets-passes-legacy-importer')
+		);
 	}
 
 	/**
-	 * @return WC_Order[]
+	 * @return array{ok:bool,orders:WC_Order[],error:string}
 	 */
 	private function query_by_created_via(string $import_id): array
 	{
-		$orders = wc_get_orders(array(
-			'limit'       => 2,
-			'status'      => 'any',
-			'created_via' => TPFWLI_Plugin::created_via($import_id),
-			'return'      => 'objects',
-		));
-		return $this->as_orders($orders);
+		return $this->query_identity_orders(
+			array(
+				'limit'       => 2,
+				'status'      => 'any',
+				'created_via' => TPFWLI_Plugin::created_via($import_id),
+				'return'      => 'objects',
+			),
+			__('Could not read existing importer orders by created_via. Import was stopped before any changes.', 'tickets-passes-legacy-importer')
+		);
 	}
 
 	/**
-	 * @param mixed $orders
-	 * @return WC_Order[]
+	 * @param array<string,mixed> $args
+	 * @return array{ok:bool,orders:WC_Order[],error:string}
 	 */
-	private function as_orders($orders): array
+	private function query_identity_orders(array $args, string $read_error): array
 	{
-		$out = array();
-		if (!is_array($orders)) {
-			return $out;
+		global $wpdb;
+
+		$previous_suppress = null;
+		$previous_show     = null;
+		if ($wpdb instanceof wpdb) {
+			$previous_suppress = $wpdb->suppress_errors(true);
+			$previous_show     = $wpdb->show_errors(false);
 		}
-		foreach ($orders as $order) {
-			if ($order instanceof WC_Order) {
-				$out[] = $order;
+
+		$sql_error = '';
+		$orders    = null;
+		try {
+			$orders = wc_get_orders($args);
+			if ($wpdb instanceof wpdb) {
+				$sql_error = (string) $wpdb->last_error;
+			}
+		} catch (Throwable $e) {
+			$sql_error = $e->getMessage();
+			$orders    = null;
+		} finally {
+			if ($wpdb instanceof wpdb) {
+				$wpdb->suppress_errors((bool) $previous_suppress);
+				$wpdb->show_errors((bool) $previous_show);
 			}
 		}
-		return $out;
+
+		if ($sql_error !== '') {
+			return array('ok' => false, 'orders' => array(), 'error' => $read_error);
+		}
+
+		if ($orders instanceof WP_Error) {
+			return array('ok' => false, 'orders' => array(), 'error' => $read_error);
+		}
+
+		if (!is_array($orders)) {
+			return array('ok' => false, 'orders' => array(), 'error' => $read_error);
+		}
+
+		$out = array();
+		foreach ($orders as $order) {
+			if (!$order instanceof WC_Order) {
+				return array('ok' => false, 'orders' => array(), 'error' => $read_error);
+			}
+			$out[] = $order;
+		}
+
+		return array('ok' => true, 'orders' => $out, 'error' => '');
 	}
 }

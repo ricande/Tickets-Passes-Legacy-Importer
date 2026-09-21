@@ -1,5 +1,6 @@
 tests/.phpunit.cache/
 tests/phpunit.phar
+tests/.uploads/
 dist/
 *.log
 .DS_Store

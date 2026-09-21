@@ -24,6 +24,16 @@ final class TPFWLI_Order_Service
 	 */
 	public function create_or_resume(string $import_id, array $customer, WC_Product $product, int $quantity, array $product_meta): array
 	{
+		$problems = TPFWLI_Dependencies::problems(true);
+		if ($problems !== array()) {
+			return array(
+				'ok'      => false,
+				'order'   => null,
+				'created' => false,
+				'error'   => implode(' ', $problems),
+			);
+		}
+
 		$existing = $this->repository->find_by_import_id($import_id);
 		if (!$existing['ok']) {
 			return array(
@@ -44,6 +54,16 @@ final class TPFWLI_Order_Service
 			);
 		}
 
+		$storage = TPFWLI_Dependencies::transactional_storage_problems();
+		if ($storage !== array()) {
+			return array(
+				'ok'      => false,
+				'order'   => null,
+				'created' => false,
+				'error'   => implode(' ', $storage),
+			);
+		}
+
 		return $this->bootstrap_new($import_id, $customer, $product, $quantity, $product_meta);
 	}
 
@@ -56,6 +76,16 @@ final class TPFWLI_Order_Service
 	 */
 	private function bootstrap_new(string $import_id, array $customer, WC_Product $product, int $quantity, array $product_meta): array
 	{
+		$storage = TPFWLI_Dependencies::transactional_storage_problems();
+		if ($storage !== array()) {
+			return array(
+				'ok'      => false,
+				'order'   => null,
+				'created' => false,
+				'error'   => implode(' ', $storage),
+			);
+		}
+
 		$order_id = 0;
 		wc_transaction_query('start');
 		try {

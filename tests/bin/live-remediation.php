@@ -3,8 +3,9 @@
  * Disposable live qualification for the remediation (lives 1–6).
  * Run as www-data against /var/www/woocommerce. Does not delete plugins.
  */
-$wp_root = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
-require $wp_root . '/wp-load.php';
+require dirname(__DIR__) . '/lib/checkout-code.php';
+tpfwli_test_load_wordpress();
+tpfwli_test_reject_foreign_importer_if_loaded();
 
 if (!class_exists('TPFWLI_Orchestrator')) {
 	fwrite(STDERR, "Importer not loaded\n");

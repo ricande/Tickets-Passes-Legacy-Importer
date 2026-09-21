@@ -2,8 +2,9 @@
 /**
  * Live 7/8 helpers. Phase is: create | verify | refund
  */
-$wp_root = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
-require $wp_root . '/wp-load.php';
+require dirname(__DIR__) . '/lib/checkout-code.php';
+tpfwli_test_load_wordpress();
+tpfwli_test_reject_foreign_importer_if_loaded();
 
 $phase = $argv[1] ?? 'create';
 $state_file = '/tmp/tpfwli-live78.json';

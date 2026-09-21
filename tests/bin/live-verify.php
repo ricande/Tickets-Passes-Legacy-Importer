@@ -2,7 +2,9 @@
 /**
  * Local live verification for one Anna Andersson qty-2 import. Not a PHPUnit test.
  */
-require '/var/www/woocommerce/wp-load.php';
+require dirname(__DIR__) . '/lib/checkout-code.php';
+tpfwli_test_load_wordpress();
+tpfwli_test_reject_foreign_importer_if_loaded();
 
 if (!class_exists('TPFWLI_Orchestrator')) {
 	fwrite(STDERR, "Importer plugin not loaded\n");

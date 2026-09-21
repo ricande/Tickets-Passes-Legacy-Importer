@@ -17,6 +17,8 @@ defined('ABSPATH') || exit;
 define('TPFWLI_VERSION', '1.0.1');
 define('TPFWLI_PLUGIN_FILE', __FILE__);
 define('TPFWLI_PLUGIN_DIR', plugin_dir_path(__FILE__));
+define('TPFWLI_MIN_WP', '6.5');
+define('TPFWLI_MIN_WC', '8.0');
 define('TPFWLI_MIN_TPFW', '1.3.0');
 
 require_once TPFWLI_PLUGIN_DIR . 'includes/class-tpfwli-plugin.php';

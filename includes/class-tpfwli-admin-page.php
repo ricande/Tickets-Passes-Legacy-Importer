@@ -50,7 +50,7 @@ final class TPFWLI_Admin_Page
 		if (!$screen || $screen->id !== 'woocommerce_page_' . self::SLUG) {
 			return;
 		}
-		foreach (TPFWLI_Dependencies::problems() as $problem) {
+		foreach (array_merge(TPFWLI_Dependencies::problems(), TPFWLI_Dependencies::transactional_storage_problems()) as $problem) {
 			echo '<div class="notice notice-error"><p>' . esc_html($problem) . '</p></div>';
 		}
 	}
@@ -103,18 +103,21 @@ final class TPFWLI_Admin_Page
 	public function handle_confirm(): void
 	{
 		$this->require_post('tpfwli_confirm');
+		$this->require_mutation_ready();
 		$this->store_run($this->orchestrator->run($this->posted_input(), 'confirm'));
 	}
 
 	public function handle_retry_issue(): void
 	{
 		$this->require_post('tpfwli_retry_issue');
+		$this->require_mutation_ready();
 		$this->store_run($this->orchestrator->run($this->posted_input(), 'retry_issue'));
 	}
 
 	public function handle_retry_email(): void
 	{
 		$this->require_post('tpfwli_retry_email');
+		$this->require_mutation_ready();
 		$this->store_run($this->orchestrator->run($this->posted_input(), 'retry_email'));
 	}
 
@@ -142,6 +145,19 @@ final class TPFWLI_Admin_Page
 			wp_die(esc_html__('You do not have permission to import legacy tickets.', 'tickets-passes-legacy-importer'), 403);
 		}
 		check_admin_referer($action);
+	}
+
+	private function require_mutation_ready(): void
+	{
+		$problems = TPFWLI_Dependencies::problems(true);
+		if ($problems === array()) {
+			return;
+		}
+		wp_die(
+			esc_html(implode(' ', $problems)),
+			esc_html__('Tickets & Passes – Legacy Ticket Importer', 'tickets-passes-legacy-importer'),
+			array('response' => 409)
+		);
 	}
 
 	/**

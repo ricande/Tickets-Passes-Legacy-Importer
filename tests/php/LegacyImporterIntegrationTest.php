@@ -578,7 +578,11 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertTrue(function_exists('tpfwli_activate'));
 		$this->assertTrue(TPFWLI_Dependencies::hpos_enabled());
 		$this->assertSame(array(), TPFWLI_Dependencies::problems(false));
+		$this->assertSame(array(), TPFWLI_Dependencies::problems(true));
+		$this->assertSame(array(), TPFWLI_Dependencies::transactional_storage_problems());
 		$this->assertNotFalse(has_action('activate_' . plugin_basename(TPFWLI_PLUGIN_FILE)));
+		$this->assertSame(tpfwli_test_checkout_plugin_file(), tpfwli_test_normalize_path(TPFWLI_PLUGIN_FILE));
+		$this->assertTrue(tpfwli_test_path_is_in_checkout((string) tpfwli_test_class_file('TPFWLI_Plugin')));
 	}
 
 	public function test_concurrent_confirm_same_uuid_creates_one_order(): void
@@ -630,6 +634,9 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$b = json_decode((string) $out2, true);
 		$this->assertIsArray($a, 'worker1: ' . $out1 . ' ' . $err1);
 		$this->assertIsArray($b, 'worker2: ' . $out2 . ' ' . $err2);
+		$expected_plugin = tpfwli_test_checkout_plugin_file();
+		$this->assertSame($expected_plugin, $a['loaded_plugin_file'] ?? '');
+		$this->assertSame($expected_plugin, $b['loaded_plugin_file'] ?? '');
 		$this->assertGreaterThan(0, (int) $a['order_id']);
 		$this->assertSame((int) $a['order_id'], (int) $b['order_id']);
 		$order = wc_get_order((int) $a['order_id']);
@@ -715,6 +722,448 @@ final class LegacyImporterIntegrationTest extends TestCase
 		if (function_exists('activate_plugin')) {
 			activate_plugin($plugin);
 		}
+	}
+
+	public function test_checkout_symlink_and_real_path_are_the_same_code(): void
+	{
+		$expected = tpfwli_test_checkout_plugin_file();
+		$dir      = sys_get_temp_dir() . '/tpfwli-symlink-' . wp_generate_uuid4();
+		$this->assertTrue(mkdir($dir, 0700, true));
+		$link = $dir . '/tickets-passes-legacy-importer.php';
+		$this->assertTrue(symlink($expected, $link));
+		try {
+			$this->assertTrue(tpfwli_test_same_checkout_path($expected, $link));
+			$this->assertSame($expected, tpfwli_test_normalize_path($link));
+			$this->assertTrue(tpfwli_test_path_is_in_checkout((string) tpfwli_test_class_file('TPFWLI_Plugin')));
+		} finally {
+			unlink($link);
+			rmdir($dir);
+		}
+	}
+
+	public function test_foreign_importer_already_loaded_aborts_with_expected_and_actual_paths(): void
+	{
+		$fake   = sys_get_temp_dir() . '/tpfwli-foreign-plugin-' . wp_generate_uuid4() . '.php';
+		$script = sys_get_temp_dir() . '/tpfwli-foreign-assert-' . wp_generate_uuid4() . '.php';
+		$helper = dirname(__DIR__) . '/lib/checkout-code.php';
+		file_put_contents($fake, "<?php\nclass TPFWLI_Plugin {}\n");
+		file_put_contents(
+			$script,
+			'<?php require ' . var_export($fake, true) . '; require ' . var_export($helper, true) . '; tpfwli_test_assert_checkout_code(true); fwrite(STDOUT, "LOADED\n");'
+		);
+
+		$spec  = array(1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
+		$pipes = array();
+		$proc  = proc_open(array(PHP_BINARY, $script), $spec, $pipes);
+		$this->assertIsResource($proc);
+		$stdout = stream_get_contents($pipes[1]);
+		$stderr = stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		$code = proc_close($proc);
+		unlink($fake);
+		unlink($script);
+
+		$this->assertNotSame(0, $code);
+		$this->assertStringNotContainsString('LOADED', (string) $stdout);
+		$this->assertStringContainsString('Expected:', (string) $stderr);
+		$this->assertStringContainsString('Actual:', (string) $stderr);
+		$this->assertStringContainsString(tpfwli_test_checkout_plugin_file(), (string) $stderr);
+		$this->assertStringContainsString($fake, (string) $stderr);
+	}
+
+	public function test_confirm_post_stops_when_hpos_disabled_after_preview(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'hpos-post@example.com',
+			'first_name' => 'HposPost',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$_POST  = $input;
+		$_POST['action'] = 'tpfwli_confirm';
+		$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_confirm');
+		$this->installWpDieThrower();
+		try {
+			$this->withHposDisabled(function () use ($input): void {
+				try {
+					(new TPFWLI_Admin_Page())->handle_confirm();
+					$this->fail('Confirm POST should have been refused after HPOS was turned off');
+				} catch (RuntimeException $e) {
+					$this->assertStringContainsString('wp_die:', $e->getMessage());
+					$this->assertStringContainsString('HPOS', $e->getMessage());
+				}
+			});
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			unset($_POST, $_REQUEST['_wpnonce']);
+		}
+	}
+
+	public function test_direct_confirm_stops_without_mutations_when_hpos_is_off(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'hpos-run@example.com',
+			'first_name' => 'HposRun',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$this->withHposDisabled(function () use ($input): void {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNotEmpty($result['errors']);
+			$this->assertStringContainsString('HPOS', implode(' ', $result['errors']));
+			$this->assertNull($result['order']);
+		});
+		$this->assertBusinessUnchanged($before, (string) $input['email']);
+	}
+
+	public function test_retry_issue_and_email_stop_when_ticket_product_type_is_disabled(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'dep-retry@example.com',
+			'first_name' => 'DepRetry',
+			'quantity'   => '1',
+		));
+		self::$mail_fail = true;
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		self::$mail_fail = false;
+		$this->assertFalse($first['ok']);
+		$order = $first['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('issued', (string) $order->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$tickets = $this->count_tickets_for_order((int) $order->get_id());
+		$orders = $this->count_import_orders();
+		self::$mail = array();
+
+		$settings = get_option('tpfw_general_settings_options', array());
+		$saved    = $settings;
+		$settings['bEnableTicketProduct'] = 0;
+		update_option('tpfw_general_settings_options', $settings);
+		try {
+			foreach (array('retry_issue', 'retry_email') as $mode) {
+				$result = (new TPFWLI_Orchestrator())->run($input, $mode);
+				$this->assertFalse($result['ok'], $mode . ' should fail when TPFW ticket type is disabled');
+				$this->assertNotEmpty($result['errors']);
+			}
+
+			$_POST = $input;
+			$_POST['action'] = 'tpfwli_retry_email';
+			$_REQUEST['_wpnonce'] = $_POST['_wpnonce'] = wp_create_nonce('tpfwli_retry_email');
+			$this->installWpDieThrower();
+			try {
+				(new TPFWLI_Admin_Page())->handle_retry_email();
+				$this->fail('Retry email POST should have been refused');
+			} catch (RuntimeException $e) {
+				$this->assertStringContainsString('wp_die:', $e->getMessage());
+			}
+		} finally {
+			update_option('tpfw_general_settings_options', $saved);
+			unset($_POST, $_REQUEST['_wpnonce']);
+		}
+
+		$fresh = wc_get_order($order->get_id());
+		$this->assertSame($stock, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame($tickets, $this->count_tickets_for_order((int) $order->get_id()));
+		$this->assertSame($orders, $this->count_import_orders());
+		$this->assertSame('issued', (string) $fresh->get_meta(TPFWLI_Plugin::META_ISSUE_STAGE));
+		$this->assertSame('failed', (string) $fresh->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_missing_issue_hooks_stop_confirm_without_mutations(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'no-hooks@example.com',
+			'first_name' => 'NoHooks',
+		));
+		$before  = $this->captureBusinessState((string) $input['email']);
+		$adapter = new TPFWLI_Tpfw_Adapter();
+		$runtime = $adapter->find_runtime();
+		$this->assertInstanceOf(TPFW_Ticket_WC_Product::class, $runtime);
+		$completed_prio = has_action('woocommerce_order_status_completed', array($runtime, 'order_status_completed'));
+		$payment_prio   = has_action('woocommerce_payment_complete', array($runtime, 'order_payment_complete'));
+		$this->assertNotFalse($completed_prio);
+		$this->assertNotFalse($payment_prio);
+		remove_action('woocommerce_order_status_completed', array($runtime, 'order_status_completed'), (int) $completed_prio);
+		remove_action('woocommerce_payment_complete', array($runtime, 'order_payment_complete'), (int) $payment_prio);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNotEmpty($result['errors']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			add_action('woocommerce_order_status_completed', array($runtime, 'order_status_completed'), (int) $completed_prio);
+			add_action('woocommerce_payment_complete', array($runtime, 'order_payment_complete'), (int) $payment_prio);
+		}
+	}
+
+	public function test_non_transactional_storage_stops_bootstrap_without_mutations(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'myisam@example.com',
+			'first_name' => 'Myisam',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = static function () {
+			return array('Order storage table wp_wc_orders uses MyISAM, which cannot roll back a crashed first-time import. InnoDB is required. The table engine was not changed.');
+		};
+		add_filter('tpfwli_transactional_storage_problems', $filter);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertStringContainsString('MyISAM', implode(' ', $result['errors']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+			$direct = (new TPFWLI_Order_Service())->create_or_resume(
+				$input['import_id'],
+				$input,
+				wc_get_product(self::$ticket_id),
+				(int) $input['quantity'],
+				array()
+			);
+			$this->assertFalse($direct['ok']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			remove_filter('tpfwli_transactional_storage_problems', $filter);
+		}
+	}
+
+	public function test_meta_lookup_sql_error_stops_import_and_does_not_create_an_order(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-meta@example.com',
+			'first_name' => 'LookupMeta',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = $this->failIdentityQueries($input['import_id'], 'meta', 1);
+		try {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertNull($found['order']);
+			$this->assertStringContainsString('import ID', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			remove_filter('query', $filter, 999);
+		}
+	}
+
+	public function test_created_via_lookup_sql_error_stops_import_and_does_not_create_an_order(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-via@example.com',
+			'first_name' => 'LookupVia',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = $this->failIdentityQueries($input['import_id'], 'created_via', 1);
+		try {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertStringContainsString('created_via', $found['error']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			remove_filter('query', $filter, 999);
+		}
+	}
+
+	public function test_later_create_or_resume_lookup_sql_error_stops_before_insert(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-later@example.com',
+			'first_name' => 'LookupLater',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = $this->failIdentityQueries($input['import_id'], 'any', 3);
+		try {
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertNull($result['order']);
+			$this->assertSame(array(), $this->db_import_order_ids($input['import_id']));
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			remove_filter('query', $filter, 999);
+		}
+	}
+
+	public function test_successful_created_via_hit_does_not_mask_a_meta_read_error(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-mask@example.com',
+			'first_name' => 'LookupMask',
+		));
+		$orphan = new WC_Order();
+		$orphan->set_status('pending');
+		$orphan->set_customer_id(0);
+		$orphan->set_created_via(TPFWLI_Plugin::created_via($input['import_id']));
+		$orphan->save();
+		$orphan_id = (int) $orphan->get_id();
+		$this->assertSame('', (string) $orphan->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = $this->failIdentityQueries($input['import_id'], 'meta', 1);
+		try {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$this->assertNull($found['order']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$fresh = wc_get_order($orphan_id);
+			$this->assertInstanceOf(WC_Order::class, $fresh);
+			$this->assertSame('', (string) $fresh->get_meta(TPFWLI_Plugin::META_IMPORT_ID));
+			$this->assertSame($before['stock'], (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+			$this->assertSame($before['tickets'], $this->count_tickets());
+			$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+			$this->assertSame(array($orphan_id), $this->db_import_order_ids($input['import_id']));
+		} finally {
+			remove_filter('query', $filter, 999);
+		}
+	}
+
+	public function test_two_matching_orders_still_stop_import(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'dup-id@example.com',
+			'first_name' => 'DupId',
+			'quantity'   => '1',
+		));
+		$first  = $this->bootstrap_identity($input);
+		$second = $this->bootstrap_identity($input);
+		$this->assertNotSame((int) $first->get_id(), (int) $second->get_id());
+		$before = $this->captureBusinessState((string) $input['email']);
+		$found  = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$this->assertFalse($found['ok']);
+		$this->assertStringContainsString('more than one', $found['error']);
+		$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertFalse($result['ok']);
+		$this->assertSame($before['stock'], (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame(0, $this->count_tickets_for_order((int) $first->get_id()));
+		$this->assertSame(0, $this->count_tickets_for_order((int) $second->get_id()));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$this->assertCount(2, $this->db_import_order_ids($input['import_id']));
+	}
+
+	public function test_successful_lookup_without_hit_allows_normal_import_and_same_id_resumes(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-ok@example.com',
+			'first_name' => 'LookupOk',
+			'quantity'   => '2',
+		));
+		$missing = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$this->assertTrue($missing['ok']);
+		$this->assertNull($missing['order']);
+		$start_stock = (int) wc_get_product(self::$ticket_id)->get_stock_quantity();
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order_id = (int) $first['order']->get_id();
+		$hit = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+		$this->assertTrue($hit['ok']);
+		$this->assertInstanceOf(WC_Order::class, $hit['order']);
+		$this->assertSame($order_id, (int) $hit['order']->get_id());
+		$second = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertSame($order_id, (int) $second['order']->get_id());
+		$this->assertSame(array($order_id), $this->db_import_order_ids($input['import_id']));
+		$this->assertSame($start_stock - 2, (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame($first['nanos'], $second['nanos']);
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_unexpected_wc_get_orders_return_is_a_read_error_not_a_miss(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'lookup-false@example.com',
+			'first_name' => 'LookupFalse',
+		));
+		$before = $this->captureBusinessState((string) $input['email']);
+		$filter = static function ($results, $args) {
+			if (($args['meta_key'] ?? '') === TPFWLI_Plugin::META_IMPORT_ID) {
+				return false;
+			}
+			return $results;
+		};
+		add_filter('woocommerce_order_query', $filter, 10, 2);
+		try {
+			$found = (new TPFWLI_Import_Repository())->find_by_import_id($input['import_id']);
+			$this->assertFalse($found['ok']);
+			$result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+			$this->assertFalse($result['ok']);
+			$this->assertBusinessUnchanged($before, (string) $input['email']);
+		} finally {
+			remove_filter('woocommerce_order_query', $filter, 10);
+		}
+	}
+
+	/**
+	 * @return array{orders:int,stock:int,tickets:int,mail:int}
+	 */
+	private function captureBusinessState(string $email): array
+	{
+		unset($email);
+		return array(
+			'orders'  => $this->count_import_orders(),
+			'stock'   => (int) wc_get_product(self::$ticket_id)->get_stock_quantity(),
+			'tickets' => $this->count_tickets(),
+			'mail'    => count(self::$mail),
+		);
+	}
+
+	/**
+	 * @param array{orders:int,stock:int,tickets:int,mail:int} $before
+	 */
+	private function assertBusinessUnchanged(array $before, string $email): void
+	{
+		$this->assertSame($before['orders'], $this->count_import_orders());
+		$this->assertSame($before['stock'], (int) wc_get_product(self::$ticket_id)->get_stock_quantity());
+		$this->assertSame($before['tickets'], $this->count_tickets());
+		$this->assertSame($before['mail'], count(self::$mail));
+		$this->assertSame(0, $this->customerMailCount($email));
+	}
+
+	/**
+	 * @param callable():void $callback
+	 */
+	private function withHposDisabled(callable $callback): void
+	{
+		$filter = static function () {
+			return 'no';
+		};
+		add_filter('pre_option_woocommerce_custom_orders_table_enabled', $filter);
+		try {
+			$callback();
+		} finally {
+			remove_filter('pre_option_woocommerce_custom_orders_table_enabled', $filter);
+		}
+	}
+
+	private function failIdentityQueries(string $import_id, string $which, int $from_call): callable
+	{
+		$calls  = 0;
+		$filter = static function ($sql) use ($import_id, $which, $from_call, &$calls) {
+			if (!is_string($sql) || !str_contains($sql, $import_id)) {
+				return $sql;
+			}
+			if (str_contains($sql, 'SELECT DISTINCT o.id')) {
+				return $sql;
+			}
+			$is_meta = str_contains($sql, TPFWLI_Plugin::META_IMPORT_ID);
+			$is_via  = str_contains($sql, TPFWLI_Plugin::CREATED_VIA_PREFIX);
+			if ($which === 'meta' && !$is_meta) {
+				return $sql;
+			}
+			if ($which === 'created_via' && !$is_via) {
+				return $sql;
+			}
+			$calls++;
+			if ($calls < $from_call) {
+				return $sql;
+			}
+			return 'SELECT id FROM tpfwli_missing_identity_lookup_table WHERE id = 1';
+		};
+		add_filter('query', $filter, 999);
+		return $filter;
 	}
 
 	/**

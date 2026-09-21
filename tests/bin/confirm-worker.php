@@ -11,19 +11,8 @@ register_shutdown_function(static function () {
 	}
 });
 
-$wp_root = getenv('TPFWLI_WP_PATH') ?: '/var/www/woocommerce';
-if (!is_readable($wp_root . '/wp-load.php')) {
-	fwrite(STDERR, "WordPress not found at {$wp_root}\n");
-	exit(1);
-}
-
-define('WP_USE_THEMES', false);
-require $wp_root . '/wp-load.php';
-
-if (!class_exists('TPFWLI_Orchestrator')) {
-	require dirname(__DIR__, 2) . '/tickets-passes-legacy-importer.php';
-	TPFWLI_Plugin::instance()->boot();
-}
+require dirname(__DIR__) . '/lib/checkout-code.php';
+$loaded_plugin_file = tpfwli_test_load_wordpress_and_checkout();
 
 $raw = stream_get_contents(STDIN);
 $input = json_decode((string) $raw, true);
@@ -40,12 +29,13 @@ $result = (new TPFWLI_Orchestrator())->run($input, 'confirm');
 $order  = $result['order'] ?? null;
 
 echo json_encode(array(
-	'ok'            => !empty($result['ok']) || !empty($result['email_already']),
-	'errors'        => $result['errors'] ?? array(),
-	'order_id'      => $order instanceof WC_Order ? (int) $order->get_id() : 0,
-	'nanos'         => $result['nanos'] ?? array(),
-	'email_already' => !empty($result['email_already']),
-	'stock_stage'   => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_STOCK_STAGE) : '',
-	'email_stage'   => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
-	'pid'           => getmypid(),
+	'ok'                 => !empty($result['ok']) || !empty($result['email_already']),
+	'errors'             => $result['errors'] ?? array(),
+	'order_id'           => $order instanceof WC_Order ? (int) $order->get_id() : 0,
+	'nanos'              => $result['nanos'] ?? array(),
+	'email_already'      => !empty($result['email_already']),
+	'stock_stage'        => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_STOCK_STAGE) : '',
+	'email_stage'        => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
+	'pid'                => getmypid(),
+	'loaded_plugin_file' => $loaded_plugin_file,
 ));
