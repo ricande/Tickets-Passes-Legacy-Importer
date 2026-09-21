@@ -1,0 +1,52 @@
+---
+description: woocommerce-test VM layout, access, snapshots, and how it differs from the host shop
+alwaysApply: true
+---
+
+# woocommerce-test VM
+
+The agent owns and operates this VM. Do not rediscover it from scratch. Leave snapshot `wordpress-clean-before-woocommerce` untouched unless the user explicitly asks to revert.
+
+## Reach it
+
+- Host hypervisor: `hpelitedesk800g6`. Domain: `woocommerce-test` (KVM/libvirt, 6 vCPU, 8 GiB).
+- Disk: `/run/media/ricande/Minecraft/libvirt-woocommerce-test/woocommerce-test.qcow2`
+- Guest hostname: `woocommerce-test`. Default IPv4: `192.168.122.196` (`virsh domifaddr woocommerce-test`).
+- SSH: `ssh ricande@192.168.122.196` (key, BatchMode). User is in `sudo`; `sudo -n` works.
+- Guest DNS from the host: `tickets-test.test` and `mailpit.tickets-test.test` → VM IP.
+- Start/stop: `virsh start woocommerce-test` / `virsh shutdown woocommerce-test`. Autostart is off.
+
+## Snapshots (internal qcow2)
+
+- `clean-ubuntu-server` — Ubuntu only.
+- `wordpress-clean-before-woocommerce` — WordPress just installed, no WooCommerce. **Do not revert the running domain to this.**
+
+Clone a disposable domain if a clean WP-only tree is needed. Never snapshot-revert the live shop to wipe WooCommerce/TPFW.
+
+## Guest shop (use this for live Mailpit / queue work)
+
+- Document root: `/var/www/tickets-test`
+- Site: `https://tickets-test.test` (HTTP redirects to HTTPS, Apache, self-signed cert under `/etc/ssl/tickets-test/`)
+- WP 7.1.1, WooCommerce 11.1.0, TPFW 1.3.4, PHP 8.3.6, MariaDB 10.11.14 at `127.0.0.1`, DB `wordpress`, prefix `wp_`, HPOS on
+- Deferred transactional emails: **off** unless a test process enables them before `WC_Emails` registers hooks
+- Active plugins: WooCommerce + TPFW only. Importer is **not** installed here until we deploy it (rsync/scp; no host bind-mount).
+- WP admin login: `admin`. PHP as web: `sudo -u www-data php …` after `require /var/www/tickets-test/wp-load.php`.
+
+## Mailpit on the guest
+
+- systemd `mailpit.service`: SMTP `127.0.0.1:1025`, UI `127.0.0.1:8025`
+- Apache proxies `https://mailpit.tickets-test.test/` → `127.0.0.1:8025` (websocket upgrade enabled)
+- WordPress sends via SMTP `127.0.0.1:1025` (`Mailer=smtp`)
+- API from the host: `curl -k https://mailpit.tickets-test.test/api/v1/info` and `/api/v1/messages`
+- Isolated test recipients only. Do not wipe the whole Mailpit store or the shop Action Scheduler queue.
+
+## Host shop is a different machine
+
+PHPUnit (`sg www-data`, `TPFWLI_WP_PATH=/var/www/woocommerce`) talks to the **host** shop, not the VM:
+
+- `http://woocommerce.local` → `127.0.0.1:/var/www/woocommerce`
+- WP 7.1, WC 11.1.0, PHP 8.5.4, MariaDB 11.8.6, DB `wordpress_woocommerce`, HPOS on
+- Checkout symlink: `wp-content/plugins/tickets-passes-legacy-importer` → this repo
+- Host Mailpit (`127.0.0.1:8025`, DB `/var/lib/mailpit/mailpit.db`) is **not** the VM Mailpit
+
+Use the VM for real queued-mail / Mailpit proofs. Keep the existing PHPUnit suite on the host checkout unless a test is written to SSH/bootstrap the guest. Deploy importer changes to the guest when the VM must run the current checkout.

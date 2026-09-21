@@ -2101,6 +2101,244 @@ final class LegacyImporterIntegrationTest extends TestCase
 		}
 	}
 
+	public function test_deferred_queue_after_sent_does_not_duplicate_customer_email(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'queue-after-sent@example.com',
+			'first_name' => 'QueueAfterSent',
+		));
+		$import = $this->runDeferredImportWorker($input, array('capture_mail' => true));
+		$this->assertTrue(!empty($import['ok']), implode('; ', $import['errors'] ?? array()));
+		$this->assertSame('sent', $import['email_stage']);
+		$this->assertSame(1, (int) $import['mail_count']);
+		$this->assertNotEmpty($import['queued']);
+		$stock = $this->db_product_stock(self::$ticket_id);
+		$tickets = $this->count_tickets_for_order((int) $import['order_id']);
+		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], true);
+		$this->assertSame($import['pid'] === $queue['pid'] ? 0 : $queue['pid'], (int) $queue['pid']);
+		$this->assertNotSame((int) $import['pid'], (int) $queue['pid']);
+		$this->assertSame('sent', $queue['email_stage']);
+		$customer_queue = 0;
+		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
+			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
+				$customer_queue++;
+			}
+		}
+		$this->assertSame(0, $customer_queue, implode(' | ', (array) ($queue['mail_subjects'] ?? array())));
+		$this->assertSame($stock, $this->db_product_stock(self::$ticket_id));
+		$this->assertSame($tickets, $this->count_tickets_for_order((int) $import['order_id']));
+
+		self::$mail = array();
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
+		$this->assertTrue(!empty($retry['ok']) || !empty($retry['email_already']));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		$again = $this->runQueuedEmailWorker((int) $import['order_id'], true);
+		$again_customer = 0;
+		foreach ((array) ($again['mail_subjects'] ?? array()) as $subject) {
+			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
+				$again_customer++;
+			}
+		}
+		$this->assertSame(0, $again_customer);
+	}
+
+	public function test_queued_complete_before_importer_send_is_suppressed(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'queue-before-send@example.com',
+			'first_name' => 'QueueBeforeSend',
+		));
+		$import = $this->runDeferredImportWorker($input, array(
+			'capture_mail' => true,
+			'abort'        => 'after_completed',
+		));
+		$this->assertSame('not_sent', $import['email_stage']);
+		$this->assertSame('issued', $import['issue_stage']);
+		$this->assertSame(0, (int) $import['mail_count']);
+		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], true);
+		$this->assertSame('not_sent', $queue['email_stage']);
+		$customer_queue = 0;
+		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
+			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
+				$customer_queue++;
+			}
+		}
+		$this->assertSame(0, $customer_queue);
+		$finish = $this->runDeferredImportWorker($input, array(
+			'mode'         => 'resume',
+			'capture_mail' => true,
+		));
+		$this->assertTrue(!empty($finish['ok']), implode('; ', $finish['errors'] ?? array()));
+		$this->assertSame('sent', $finish['email_stage']);
+		$this->assertSame(1, (int) $finish['mail_count']);
+	}
+
+	public function test_abort_after_mailer_accepted_does_not_autoresend(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'abort-after-accepted@example.com',
+			'first_name' => 'AbortAccepted',
+		));
+		$import = $this->runDeferredImportWorker($input, array(
+			'capture_mail' => true,
+			'abort'        => 'after_accepted_before_sent',
+		));
+		$this->assertSame('sending', $import['email_stage']);
+		$this->assertSame(1, (int) $import['mail_count']);
+		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], true);
+		$customer_queue = 0;
+		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
+			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
+				$customer_queue++;
+			}
+		}
+		$this->assertSame(0, $customer_queue);
+		$this->assertSame('sending', (string) wc_get_order((int) $import['order_id'])->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		self::$mail = array();
+		$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
+		$this->assertTrue(!empty($retry['email_unknown']));
+		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+	}
+
+	public function test_allow_window_is_limited_to_completed_email_on_that_order(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'allow-window@example.com',
+			'first_name' => 'AllowWindow',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = $first['order'];
+		$other_input = $this->valid_input(array(
+			'email'      => 'allow-window-other@example.com',
+			'first_name' => 'AllowOther',
+		));
+		$other = (new TPFWLI_Orchestrator())->run($other_input, 'confirm');
+		$this->assertTrue($other['ok'], implode('; ', $other['errors']));
+		$svc = TPFWLI_Email_Service::instance();
+		$mailer = WC()->mailer();
+		$completed = $mailer->emails['WC_Email_Customer_Completed_Order'];
+		$processing = $mailer->emails['WC_Email_Customer_Processing_Order'];
+		$ref = new ReflectionClass($svc);
+		$allow_id = $ref->getProperty('allow_order_id');
+		$allow_email = $ref->getProperty('allow_email_id');
+		$allow_id->setValue($svc, (int) $order->get_id());
+		$allow_email->setValue($svc, TPFWLI_Email_Service::COMPLETED_EMAIL_ID);
+		try {
+			$this->assertTrue($svc->filter_enabled(false, $order, $completed));
+			$this->assertFalse($svc->filter_enabled(true, $order, $processing));
+			$this->assertFalse($svc->filter_enabled(true, $other['order'], $completed));
+		} finally {
+			$allow_id->setValue($svc, 0);
+			$allow_email->setValue($svc, '');
+		}
+	}
+
+	public function test_regular_web_order_and_later_refund_cancel_still_email(): void
+	{
+		self::$mail = array();
+		$web = wc_create_order();
+		$web->set_billing_email('web-order-step4@example.com');
+		$web->set_billing_first_name('Web');
+		$web->add_product(wc_get_product(self::$simple_id), 1);
+		$web->calculate_totals();
+		$web->save();
+		$web->update_status('completed', 'web order complete', true);
+		$this->assertSame(1, $this->customerMailCount('web-order-step4@example.com'));
+
+		$input = $this->valid_input(array(
+			'email'      => 'later-refund-cancel@example.com',
+			'first_name' => 'LaterRefund',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = $first['order'];
+		self::$mail = array();
+		$refund = wc_create_refund(array(
+			'order_id'       => $order->get_id(),
+			'amount'         => (string) $order->get_total(),
+			'reason'         => 'step4 later refund',
+			'refund_payment' => false,
+			'restock_items'  => false,
+		));
+		$this->assertInstanceOf(WC_Order_Refund::class, $refund);
+		$this->assertGreaterThanOrEqual(1, $this->customerMailCount((string) $input['email']));
+
+		$input2 = $this->valid_input(array(
+			'email'      => 'later-cancel@example.com',
+			'first_name' => 'LaterCancel',
+		));
+		$second = (new TPFWLI_Orchestrator())->run($input2, 'confirm');
+		$this->assertTrue($second['ok'], implode('; ', $second['errors']));
+		$cancel_mail = WC()->mailer()->emails['WC_Email_Customer_Cancelled_Order'] ?? null;
+		if (is_object($cancel_mail) && method_exists($cancel_mail, 'enable')) {
+			$cancel_mail->enable();
+		}
+		$svc = TPFWLI_Email_Service::instance();
+		if (is_object($cancel_mail)) {
+			$this->assertTrue($svc->filter_enabled(true, $second['order'], $cancel_mail));
+		}
+		self::$mail = array();
+		$second['order']->update_status('cancelled', 'step4 later cancel', true);
+		if (is_object($cancel_mail) && !empty($cancel_mail->is_enabled())) {
+			$this->assertGreaterThanOrEqual(1, $this->customerMailCount((string) $input2['email']));
+		}
+	}
+
+	public function test_manual_send_order_details_still_works(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'manual-details@example.com',
+			'first_name' => 'ManualDetails',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = wc_get_order($first['order']->get_id());
+		self::$mail = array();
+		$_POST['wc_order_action'] = 'send_order_details';
+		try {
+			$invoice = WC()->mailer()->emails['WC_Email_Customer_Invoice'] ?? null;
+			$this->assertIsObject($invoice);
+			$invoice->trigger($order->get_id(), $order);
+			$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+		} finally {
+			unset($_POST['wc_order_action']);
+		}
+	}
+
+	public function test_host_mailpit_receives_one_completed_import_email(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'mailpit-' . wp_generate_uuid4() . '@example.com',
+			'first_name' => 'MailpitReal',
+		));
+		$before = tpfwli_test_mailpit_messages_for_recipient('http://127.0.0.1:8025', (string) $input['email']);
+		$import = $this->runDeferredImportWorker($input, array('capture_mail' => false));
+		$this->assertTrue(!empty($import['ok']), implode('; ', $import['errors'] ?? array()));
+		$this->runQueuedEmailWorker((int) $import['order_id'], false);
+		$after = tpfwli_test_mailpit_messages_for_recipient('http://127.0.0.1:8025', (string) $input['email']);
+		$this->assertSame($before['count'] + 1, $after['count'], wp_json_encode($after['subjects']));
+		$found = false;
+		foreach ((array) ($after['messages'] ?? array()) as $msg) {
+			$id = (string) ($msg['ID'] ?? '');
+			if ($id === '') {
+				continue;
+			}
+			$raw = @file_get_contents('http://127.0.0.1:8025/api/v1/message/' . rawurlencode($id));
+			$data = is_string($raw) ? json_decode($raw, true) : null;
+			$body = is_array($data) ? strtolower((string) ($data['Text'] ?? '') . (string) ($data['HTML'] ?? '')) : '';
+			if (
+				str_contains($body, strtolower((string) $input['email']))
+				&& (str_contains($body, (string) $import['order_id']) || str_contains(strtolower((string) ($msg['Subject'] ?? '')), (string) $import['order_id']))
+				&& (str_contains($body, strtolower((string) ($import['nanos'][0] ?? 'nope'))) || str_contains($body, 'qr') || str_contains($body, 'biljett') || str_contains($body, 'ticket'))
+			) {
+				$found = true;
+				break;
+			}
+		}
+		$this->assertTrue($found, 'Mailpit message missing recipient, order or ticket content');
+	}
+
 	public function test_identity_lookup_refuses_live_and_trash_duplicates(): void
 	{
 		$input = $this->valid_input(array(
@@ -2975,6 +3213,55 @@ final class LegacyImporterIntegrationTest extends TestCase
 			unset($ignored);
 		}
 		wp_cache_delete($order_id, 'orders');
+	}
+
+	/**
+	 * @param array<string,mixed> $input
+	 * @param array<string,mixed> $extra
+	 * @return array<string,mixed>
+	 */
+	private function runDeferredImportWorker(array $input, array $extra = array()): array
+	{
+		$payload = array_merge(array(
+			'input'        => $input,
+			'mode'         => 'confirm',
+			'capture_mail' => true,
+		), $extra);
+		return $this->runJsonFileWorker(dirname(__DIR__) . '/bin/deferred-import-worker.php', $payload);
+	}
+
+	/**
+	 * @return array<string,mixed>
+	 */
+	private function runQueuedEmailWorker(int $order_id, bool $capture_mail): array
+	{
+		return $this->runJsonFileWorker(dirname(__DIR__) . '/bin/run-queued-email-worker.php', array(
+			'order_id'     => $order_id,
+			'capture_mail' => $capture_mail,
+		));
+	}
+
+	/**
+	 * @param array<string,mixed> $payload
+	 * @return array<string,mixed>
+	 */
+	private function runJsonFileWorker(string $bin, array $payload): array
+	{
+		$file = tempnam(sys_get_temp_dir(), 'tpfwli-json-');
+		$this->assertNotFalse($file);
+		file_put_contents($file, wp_json_encode($payload));
+		$spec = array(1 => array('pipe', 'w'), 2 => array('pipe', 'w'));
+		$proc = proc_open(array(PHP_BINARY, $bin, $file), $spec, $pipes);
+		$this->assertIsResource($proc);
+		$out = stream_get_contents($pipes[1]);
+		$err = stream_get_contents($pipes[2]);
+		fclose($pipes[1]);
+		fclose($pipes[2]);
+		proc_close($proc);
+		@unlink($file);
+		$decoded = json_decode((string) $out, true);
+		$this->assertIsArray($decoded, (string) $out . "\n" . (string) $err);
+		return $decoded;
 	}
 
 	private function failRefundQueries(int $order_id): callable

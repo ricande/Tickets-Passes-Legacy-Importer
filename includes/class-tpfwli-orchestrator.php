@@ -513,6 +513,9 @@ final class TPFWLI_Orchestrator
 
 		$this->orders->set_stage($order, TPFWLI_Plugin::META_EMAIL_STAGE, 'sending');
 		$sent = $this->email->send_completed_email($order);
+		if (!empty($sent['ok'])) {
+			do_action('tpfwli_email_checkpoint', 'after_accepted_before_sent', $order);
+		}
 
 		if (!empty($sent['unknown'])) {
 			$this->orders->set_stage(
