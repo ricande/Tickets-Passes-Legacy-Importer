@@ -70,7 +70,9 @@ tpfwli_test_dispatch_deferred_email_queue();
 
 $order = $result['order'] ?? null;
 $order_id = $order instanceof WC_Order ? (int) $order->get_id() : 0;
-$queued = $order_id > 0 ? tpfwli_test_pending_queued_emails_for_order($order_id) : array();
+$queued    = $order_id > 0 ? tpfwli_test_pending_queued_emails_for_order($order_id) : array();
+$recipient = isset($input['input']['email']) ? (string) $input['input']['email'] : '';
+$for_to    = $recipient !== '' ? tpfwli_test_mail_atts_to_recipient($mail, $recipient) : array();
 
 echo wp_json_encode(array(
 	'ok'                 => !empty($result['ok']) || !empty($result['email_already']),
@@ -86,9 +88,14 @@ echo wp_json_encode(array(
 		return array('id' => $job['id'], 'filter' => $job['filter']);
 	}, $queued),
 	'mail_count'         => count($mail),
+	'mail_for_recipient' => count($for_to),
 	'mail_subjects'      => array_map(static function ($atts) {
 		return (string) ($atts['subject'] ?? '');
 	}, $mail),
+	'recipient_subjects' => array_map(static function ($atts) {
+		return (string) ($atts['subject'] ?? '');
+	}, $for_to),
 	'loaded_plugin_file' => $loaded,
+	'revision'           => tpfwli_test_loaded_revision(),
 	'pid'                => getmypid(),
 )) . PHP_EOL;

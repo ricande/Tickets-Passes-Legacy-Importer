@@ -75,9 +75,10 @@ final class TPFWLI_Email_Service
 			return (bool) $enabled;
 		}
 
-		$order = wc_get_order($object->get_id());
+		$identified_import = $this->is_importer_order($object);
+		$order             = wc_get_order($object->get_id());
 		if (!$order instanceof WC_Order) {
-			return (bool) $enabled;
+			return $identified_import ? false : (bool) $enabled;
 		}
 		if (!$this->is_importer_order($order)) {
 			return (bool) $enabled;

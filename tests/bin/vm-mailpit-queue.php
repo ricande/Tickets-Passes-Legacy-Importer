@@ -16,15 +16,20 @@ if ($order_id < 1) {
 }
 
 $before = tpfwli_test_pending_queued_emails_for_order($order_id);
-$ran    = tpfwli_test_run_queued_email_jobs($before);
+$ran    = tpfwli_test_run_queued_email_jobs($before, $order_id);
+$after  = tpfwli_test_pending_queued_emails_for_order($order_id);
 $order  = wc_get_order($order_id);
 
 echo wp_json_encode(array(
 	'order_id'    => $order_id,
 	'queued'      => array_map(static function ($job) {
-		return $job['filter'];
+		return array('id' => $job['id'], 'filter' => $job['filter']);
 	}, $before),
 	'ran'         => $ran,
+	'queued_after'=> array_map(static function ($job) {
+		return array('id' => $job['id'], 'filter' => $job['filter']);
+	}, $after),
 	'email_stage' => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
 	'plugin'      => defined('TPFWLI_PLUGIN_FILE') ? TPFWLI_PLUGIN_FILE : '',
+	'revision'    => tpfwli_test_loaded_revision(),
 )) . PHP_EOL;

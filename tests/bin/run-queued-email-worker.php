@@ -32,26 +32,33 @@ if ($user) {
 	wp_set_current_user((int) $user->ID);
 }
 
-$before = tpfwli_test_pending_queued_emails_for_order($order_id);
-$ran    = tpfwli_test_run_queued_email_jobs($before);
-$after  = tpfwli_test_pending_queued_emails_for_order($order_id);
-$order  = wc_get_order($order_id);
+$before    = tpfwli_test_pending_queued_emails_for_order($order_id);
+$ran       = tpfwli_test_run_queued_email_jobs($before, $order_id);
+$after     = tpfwli_test_pending_queued_emails_for_order($order_id);
+$order     = wc_get_order($order_id);
+$recipient = $order instanceof WC_Order ? (string) $order->get_billing_email() : '';
+$for_to    = $recipient !== '' ? tpfwli_test_mail_atts_to_recipient($mail, $recipient) : array();
 
 echo wp_json_encode(array(
-	'order_id'           => $order_id,
-	'queued_before'      => array_map(static function ($job) {
+	'order_id'            => $order_id,
+	'queued_before'       => array_map(static function ($job) {
 		return array('id' => $job['id'], 'filter' => $job['filter']);
 	}, $before),
-	'ran'                => $ran,
-	'queued_after'       => array_map(static function ($job) {
+	'ran'                 => $ran,
+	'queued_after'        => array_map(static function ($job) {
 		return array('id' => $job['id'], 'filter' => $job['filter']);
 	}, $after),
-	'email_stage'        => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
-	'status'             => $order instanceof WC_Order ? $order->get_status() : '',
-	'mail_count'         => count($mail),
-	'mail_subjects'      => array_map(static function ($atts) {
+	'email_stage'         => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
+	'status'              => $order instanceof WC_Order ? $order->get_status() : '',
+	'mail_count'          => count($mail),
+	'mail_for_recipient'  => count($for_to),
+	'mail_subjects'       => array_map(static function ($atts) {
 		return (string) ($atts['subject'] ?? '');
 	}, $mail),
-	'loaded_plugin_file' => $loaded,
-	'pid'                => getmypid(),
+	'recipient_subjects'  => array_map(static function ($atts) {
+		return (string) ($atts['subject'] ?? '');
+	}, $for_to),
+	'loaded_plugin_file'  => $loaded,
+	'revision'            => tpfwli_test_loaded_revision(),
+	'pid'                 => getmypid(),
 )) . PHP_EOL;

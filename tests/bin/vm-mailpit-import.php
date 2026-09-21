@@ -44,7 +44,8 @@ echo wp_json_encode(array(
 	'nanos'       => $result['nanos'] ?? array(),
 	'email_stage' => $order instanceof WC_Order ? (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE) : '',
 	'queued'      => array_map(static function ($job) {
-		return $job['filter'];
+		return array('id' => $job['id'], 'filter' => $job['filter']);
 	}, $queued),
 	'plugin'      => defined('TPFWLI_PLUGIN_FILE') ? TPFWLI_PLUGIN_FILE : '',
+	'revision'    => tpfwli_test_loaded_revision(),
 )) . PHP_EOL;

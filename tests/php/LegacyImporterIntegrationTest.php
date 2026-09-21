@@ -2110,7 +2110,7 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$import = $this->runDeferredImportWorker($input, array('capture_mail' => true));
 		$this->assertTrue(!empty($import['ok']), implode('; ', $import['errors'] ?? array()));
 		$this->assertSame('sent', $import['email_stage']);
-		$this->assertSame(1, (int) $import['mail_count']);
+		$this->assertSame(1, (int) $import['mail_for_recipient']);
 		$this->assertNotEmpty($import['queued']);
 		$stock = $this->db_product_stock(self::$ticket_id);
 		$tickets = $this->count_tickets_for_order((int) $import['order_id']);
@@ -2118,13 +2118,8 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame($import['pid'] === $queue['pid'] ? 0 : $queue['pid'], (int) $queue['pid']);
 		$this->assertNotSame((int) $import['pid'], (int) $queue['pid']);
 		$this->assertSame('sent', $queue['email_stage']);
-		$customer_queue = 0;
-		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
-			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
-				$customer_queue++;
-			}
-		}
-		$this->assertSame(0, $customer_queue, implode(' | ', (array) ($queue['mail_subjects'] ?? array())));
+		$this->assertQueuedJobsRan($import['queued'], $queue);
+		$this->assertSame(0, (int) $queue['mail_for_recipient'], implode(' | ', (array) ($queue['recipient_subjects'] ?? array())));
 		$this->assertSame($stock, $this->db_product_stock(self::$ticket_id));
 		$this->assertSame($tickets, $this->count_tickets_for_order((int) $import['order_id']));
 
@@ -2132,14 +2127,13 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
 		$this->assertTrue(!empty($retry['ok']) || !empty($retry['email_already']));
 		$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+
+		$redeliver_id = tpfwli_test_enqueue_completed_notification((int) $import['order_id']);
+		$this->assertGreaterThan(0, $redeliver_id);
 		$again = $this->runQueuedEmailWorker((int) $import['order_id'], true);
-		$again_customer = 0;
-		foreach ((array) ($again['mail_subjects'] ?? array()) as $subject) {
-			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
-				$again_customer++;
-			}
-		}
-		$this->assertSame(0, $again_customer);
+		$this->assertContains($redeliver_id, array_map('intval', (array) ($again['ran'] ?? array())));
+		$this->assertSame(0, (int) $again['mail_for_recipient']);
+		$this->assertSame('sent', $again['email_stage']);
 	}
 
 	public function test_queued_complete_before_importer_send_is_suppressed(): void
@@ -2157,20 +2151,15 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$this->assertSame(0, (int) $import['mail_count']);
 		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], true);
 		$this->assertSame('not_sent', $queue['email_stage']);
-		$customer_queue = 0;
-		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
-			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
-				$customer_queue++;
-			}
-		}
-		$this->assertSame(0, $customer_queue);
+		$this->assertQueuedJobsRan($import['queued'], $queue);
+		$this->assertSame(0, (int) $queue['mail_for_recipient']);
 		$finish = $this->runDeferredImportWorker($input, array(
 			'mode'         => 'resume',
 			'capture_mail' => true,
 		));
 		$this->assertTrue(!empty($finish['ok']), implode('; ', $finish['errors'] ?? array()));
 		$this->assertSame('sent', $finish['email_stage']);
-		$this->assertSame(1, (int) $finish['mail_count']);
+		$this->assertSame(1, (int) $finish['mail_for_recipient']);
 	}
 
 	public function test_abort_after_mailer_accepted_does_not_autoresend(): void
@@ -2184,15 +2173,10 @@ final class LegacyImporterIntegrationTest extends TestCase
 			'abort'        => 'after_accepted_before_sent',
 		));
 		$this->assertSame('sending', $import['email_stage']);
-		$this->assertSame(1, (int) $import['mail_count']);
+		$this->assertSame(1, (int) $import['mail_for_recipient']);
 		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], true);
-		$customer_queue = 0;
-		foreach ((array) ($queue['mail_subjects'] ?? array()) as $subject) {
-			if (str_contains(strtolower((string) $subject), 'på väg') || str_contains(strtolower((string) $subject), 'complete')) {
-				$customer_queue++;
-			}
-		}
-		$this->assertSame(0, $customer_queue);
+		$this->assertQueuedJobsRan($import['queued'], $queue);
+		$this->assertSame(0, (int) $queue['mail_for_recipient']);
 		$this->assertSame('sending', (string) wc_get_order((int) $import['order_id'])->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
 		self::$mail = array();
 		$retry = (new TPFWLI_Orchestrator())->run($input, 'retry_email');
@@ -2232,6 +2216,171 @@ final class LegacyImporterIntegrationTest extends TestCase
 			$allow_id->setValue($svc, 0);
 			$allow_email->setValue($svc, '');
 		}
+	}
+
+	public function test_failed_order_reread_does_not_reopen_import_email(): void
+	{
+		$input = $this->valid_input(array(
+			'email'      => 'reread-fail@example.com',
+			'first_name' => 'RereadFail',
+		));
+		$first = (new TPFWLI_Orchestrator())->run($input, 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$order = $first['order'];
+		$this->assertInstanceOf(WC_Order::class, $order);
+		$this->assertSame('sent', (string) $order->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		$this->assertSame(1, $this->customerMailCount((string) $input['email']));
+
+		$completed = WC()->mailer()->emails['WC_Email_Customer_Completed_Order'];
+		$svc = TPFWLI_Email_Service::instance();
+		$ref = new ReflectionClass($svc);
+		$allow_id = $ref->getProperty('allow_order_id');
+		$allow_email = $ref->getProperty('allow_email_id');
+		$allow_id->setValue($svc, (int) $order->get_id());
+		$allow_email->setValue($svc, TPFWLI_Email_Service::COMPLETED_EMAIL_ID);
+		$this->poisonOrderCache((int) $order->get_id());
+		try {
+			$this->assertFalse($svc->filter_enabled(true, $order, $completed));
+			self::$mail = array();
+			$completed->trigger((int) $order->get_id(), $order);
+			$this->assertSame(0, $this->customerMailCount((string) $input['email']));
+		} finally {
+			$allow_id->setValue($svc, 0);
+			$allow_email->setValue($svc, '');
+			$this->forgetOrderCache((int) $order->get_id());
+		}
+		$this->assertSame('sent', (string) wc_get_order($order->get_id())->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+
+		self::$mail = array();
+		$web = wc_create_order();
+		$web->set_billing_email('web-reread-control@example.com');
+		$web->set_billing_first_name('WebReread');
+		$web->add_product(wc_get_product(self::$simple_id), 1);
+		$web->calculate_totals();
+		$web->save();
+		$this->poisonOrderCache((int) $web->get_id());
+		try {
+			$completed->trigger((int) $web->get_id(), $web);
+			$this->assertSame(1, $this->customerMailCount('web-reread-control@example.com'));
+		} finally {
+			$this->forgetOrderCache((int) $web->get_id());
+		}
+	}
+
+	public function test_queued_email_selection_is_exact_and_paged(): void
+	{
+		$created = array();
+		try {
+			for ($i = 0; $i < 105; $i++) {
+				$created[] = tpfwli_test_enqueue_completed_notification(900000 + $i);
+			}
+			$job_85 = (int) WC()->queue()->add(
+				'woocommerce_send_queued_transactional_email',
+				array(
+					'woocommerce_order_status_completed',
+					array(
+						85,
+						array(
+							'__woocommerce_deferred_email_object' => array(
+								'type' => 'order',
+								'id'   => 85,
+							),
+						),
+					),
+				),
+				'woocommerce-emails'
+			);
+			$job_185 = (int) WC()->queue()->add(
+				'woocommerce_send_queued_transactional_email',
+				array(
+					'woocommerce_order_status_completed',
+					array(
+						185,
+						array(
+							'__woocommerce_deferred_email_object' => array(
+								'type' => 'order',
+								'id'   => 185,
+							),
+						),
+					),
+				),
+				'woocommerce-emails'
+			);
+			$job_product = (int) WC()->queue()->add(
+				'woocommerce_send_queued_transactional_email',
+				array(
+					'woocommerce_low_stock',
+					array(
+						array(
+							'__woocommerce_deferred_email_object' => array(
+								'type' => 'product',
+								'id'   => 85,
+							),
+						),
+					),
+				),
+				'woocommerce-emails'
+			);
+			$job_text = (int) WC()->queue()->add(
+				'woocommerce_send_queued_transactional_email',
+				array(
+					'woocommerce_new_customer_note',
+					array(
+						array(
+							'order_id'      => 999001,
+							'customer_note' => 'mentions 85 and 185 in free text',
+						),
+					),
+				),
+				'woocommerce-emails'
+			);
+			$created = array_merge($created, array($job_85, $job_185, $job_product, $job_text));
+			$matched_85 = tpfwli_test_pending_queued_emails_for_order(85);
+			$matched_185 = tpfwli_test_pending_queued_emails_for_order(185);
+			$ids_85 = array_column($matched_85, 'id');
+			$ids_185 = array_column($matched_185, 'id');
+			$this->assertContains($job_85, $ids_85);
+			$this->assertContains($job_185, $ids_185);
+			$this->assertNotContains($job_185, $ids_85);
+			$this->assertNotContains($job_85, $ids_185);
+			$this->assertNotContains($job_product, $ids_85);
+			$this->assertNotContains($job_text, $ids_85);
+			$this->assertNotContains($created[85], $ids_85);
+			$this->assertSame(array(), tpfwli_test_run_queued_email_jobs($matched_185, 85));
+			$store = ActionScheduler::store();
+			$this->assertSame(ActionScheduler_Store::STATUS_PENDING, $store->get_status($job_185));
+		} finally {
+			tpfwli_test_cancel_queued_email_jobs($created);
+		}
+	}
+
+	public function test_queued_jobs_for_another_order_are_not_run(): void
+	{
+		$first = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'queue-owner@example.com',
+			'first_name' => 'QueueOwner',
+		)), 'confirm');
+		$other = (new TPFWLI_Orchestrator())->run($this->valid_input(array(
+			'email'      => 'queue-other@example.com',
+			'first_name' => 'QueueOther',
+		)), 'confirm');
+		$this->assertTrue($first['ok'], implode('; ', $first['errors']));
+		$this->assertTrue($other['ok'], implode('; ', $other['errors']));
+		$owner_id = (int) $first['order']->get_id();
+		$other_id = (int) $other['order']->get_id();
+		$owner_job = tpfwli_test_enqueue_completed_notification($owner_id);
+		$other_job = tpfwli_test_enqueue_completed_notification($other_id);
+		$this->assertGreaterThan(0, $owner_job);
+		$this->assertGreaterThan(0, $other_job);
+		$other_stage = (string) $other['order']->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE);
+		$queue = $this->runQueuedEmailWorker($owner_id, true);
+		$this->assertContains($owner_job, array_map('intval', (array) ($queue['ran'] ?? array())));
+		$this->assertNotContains($other_job, array_map('intval', (array) ($queue['ran'] ?? array())));
+		$this->assertSame(0, (int) $queue['mail_for_recipient']);
+		$store = ActionScheduler::store();
+		$this->assertSame(ActionScheduler_Store::STATUS_PENDING, $store->get_status($other_job));
+		$this->assertSame($other_stage, (string) wc_get_order($other_id)->get_meta(TPFWLI_Plugin::META_EMAIL_STAGE));
+		tpfwli_test_cancel_queued_email_jobs(array($other_job));
 	}
 
 	public function test_regular_web_order_and_later_refund_cancel_still_email(): void
@@ -2315,7 +2464,8 @@ final class LegacyImporterIntegrationTest extends TestCase
 		$before = tpfwli_test_mailpit_messages_for_recipient('http://127.0.0.1:8025', (string) $input['email']);
 		$import = $this->runDeferredImportWorker($input, array('capture_mail' => false));
 		$this->assertTrue(!empty($import['ok']), implode('; ', $import['errors'] ?? array()));
-		$this->runQueuedEmailWorker((int) $import['order_id'], false);
+		$queue = $this->runQueuedEmailWorker((int) $import['order_id'], false);
+		$this->assertQueuedJobsRan($import['queued'], $queue);
 		$after = tpfwli_test_mailpit_messages_for_recipient('http://127.0.0.1:8025', (string) $input['email']);
 		$this->assertSame($before['count'] + 1, $after['count'], wp_json_encode($after['subjects']));
 		$found = false;
@@ -3189,6 +3339,33 @@ final class LegacyImporterIntegrationTest extends TestCase
 		} finally {
 			remove_filter('pre_option_woocommerce_custom_orders_table_enabled', $filter);
 		}
+	}
+
+	/**
+	 * @param array<int,array<string,mixed>> $queued
+	 * @param array<string,mixed>            $queue
+	 */
+	private function assertQueuedJobsRan(array $queued, array $queue): void
+	{
+		$queued_ids = array();
+		foreach ($queued as $job) {
+			$id = (int) ($job['id'] ?? 0);
+			if ($id > 0) {
+				$queued_ids[] = $id;
+			}
+		}
+		$this->assertNotEmpty($queued_ids, 'import must leave deferred jobs for the test order');
+		$ran = array_map('intval', (array) ($queue['ran'] ?? array()));
+		$this->assertNotEmpty($ran, 'zero mail is not a pass unless the expected jobs ran');
+		$this->assertEqualsCanonicalizing($queued_ids, $ran);
+	}
+
+	private function poisonOrderCache(int $order_id): void
+	{
+		$this->forgetOrderCache($order_id);
+		$cache = wc_get_container()->get(\Automattic\WooCommerce\Caches\OrderCache::class);
+		$cache->set(new WC_Order(), $order_id);
+		$this->assertNotInstanceOf(WC_Order::class, wc_get_order($order_id));
 	}
 
 	private function forgetOrderCache(int $order_id): void
